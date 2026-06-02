@@ -6,9 +6,11 @@ import { SignalTsClient, type SignalChatConnection } from "./client.js";
 describe("SignalTsClient", () => {
   it("connects through the injected connection factory and sends encrypted payloads", async () => {
     const sendMessage = vi.fn(async () => {});
+    const sendSyncMessage = vi.fn(async () => {});
     const disconnect = vi.fn(async () => {});
     const connection: SignalChatConnection = {
       sendMessage,
+      sendSyncMessage,
       disconnect,
       connectionInfo: () => ({ localPort: 1, ipVersion: "IPv4", toString: () => "fake" }),
     };
@@ -44,4 +46,43 @@ describe("SignalTsClient", () => {
     );
     expect(disconnect).toHaveBeenCalledTimes(1);
   });
+
+  it("sends encrypted sync payloads through the authenticated connection", async () => {
+    const sendMessage = vi.fn(async () => {});
+    const sendSyncMessage = vi.fn(async () => {});
+    const connection: SignalChatConnection = {
+      sendMessage,
+      sendSyncMessage,
+      disconnect: vi.fn(async () => {}),
+      connectionInfo: () => ({ localPort: 1, ipVersion: "IPv4", toString: () => "fake" }),
+    };
+    const client = new SignalTsClient({
+      account: {
+        auth: { username: "user.1", password: "pass" },
+        device: {
+          aci: "11111111-1111-4111-8111-111111111111",
+          deviceId: 1,
+          registrationId: 42,
+        },
+      },
+      connectionFactory: async () => connection,
+    });
+
+    await client.connect();
+    await client.sendSyncMessage({
+      timestamp: 456,
+      contents: [] as readonly SingleOutboundUnsealedMessage[],
+      urgent: false,
+    });
+
+    expect(sendSyncMessage).toHaveBeenCalledWith(
+      {
+        timestamp: 456,
+        contents: [],
+        urgent: false,
+      },
+      undefined,
+    );
+  });
+
 });

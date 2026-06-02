@@ -1,4 +1,5 @@
 import type { Net } from "@signalapp/libsignal-client";
+import { Aci, ProtocolAddress } from "@signalapp/libsignal-client";
 
 export type SignalEnvironment = "production" | "staging";
 
@@ -22,4 +23,8 @@ export type SignalAccountState = {
 
 export function resolveLibsignalEnvironment(environment: SignalEnvironment): Net.Environment {
   return environment === "staging" ? 0 : 1;
+}
+
+export function createSignalLocalAddress(account: SignalAccountState): ProtocolAddress {
+  return ProtocolAddress.new(Aci.fromUuid(account.device.aci), account.device.deviceId);
 }

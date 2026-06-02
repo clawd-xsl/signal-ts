@@ -1,5 +1,7 @@
+import type { Bytes } from "./bytes.js";
+
 export type SignalIncomingEnvelope = {
-  envelope: Uint8Array;
+  envelope: Bytes;
   timestamp: number;
   ack: () => void;
 };

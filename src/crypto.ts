@@ -1,13 +1,34 @@
 import {
+  Aci,
+  CiphertextMessageType,
   CiphertextMessage,
+  PlaintextContent,
+  PreKeySignalMessage,
   ProtocolAddress,
+  PublicKey,
+  SignalMessage,
   type PreKeyBundle,
   type ServiceId,
+  groupDecrypt,
   processPreKeyBundle,
+  sealedSenderDecryptMessage,
+  sealedSenderDecryptToUsmc,
+  signalDecrypt,
+  signalDecryptPreKey,
   signalEncrypt,
 } from "@signalapp/libsignal-client";
-import type { Bytes } from "./bytes.js";
+import { copyBytes, type Bytes } from "./bytes.js";
 import type { LibsignalStores } from "./store.js";
+import {
+  decodeSignalContent,
+  decodeSignalEnvelope,
+  requireEnvelopeSource,
+  SignalEnvelopeType,
+  type SignalContent,
+  type SignalEnvelope,
+} from "./messages.js";
+import { SignalTsUnsupportedError } from "./errors.js";
+import { getSignalUnidentifiedSenderTrustRoots } from "./trust-roots.js";
 
 export type SignalRecipientDevice = {
   serviceId: ServiceId;
@@ -30,6 +51,40 @@ export type EncryptedDeviceMessage = {
   contents: CiphertextMessage;
 };
 
+export type DecryptIncomingEnvelopeParams = {
+  envelope: SignalEnvelope | Bytes;
+  localAddress: ProtocolAddress;
+  sealedSender?: SealedSenderDecryptOptions;
+  stores: Pick<
+    LibsignalStores,
+    | "identityStore"
+    | "sessionStore"
+    | "preKeyStore"
+    | "signedPreKeyStore"
+    | "kyberPreKeyStore"
+  > & Partial<Pick<LibsignalStores, "senderKeyStore">>;
+};
+
+export type SealedSenderDecryptOptions = {
+  trustRoot?: PublicKey;
+  trustRoots?: PublicKey[];
+  localE164?: string | null;
+  localAci: string;
+  localDeviceId: number;
+};
+
+export type DecryptedIncomingMessage = {
+  envelope: SignalEnvelope;
+  plaintext: Bytes;
+  content: SignalContent;
+  sealedSender?: {
+    senderAci?: string;
+    senderUuid: string;
+    senderE164: string | null;
+    deviceId: number;
+  };
+};
+
 export async function encryptPayloadForDevice({
   localAddress,
   device,
@@ -49,7 +104,7 @@ export async function encryptPayloadForDevice({
     );
   }
   const contents = await signalEncrypt(
-    payload,
+    padSignalMessageBody(payload),
     remoteAddress,
     localAddress,
     stores.sessionStore,
@@ -61,4 +116,394 @@ export async function encryptPayloadForDevice({
     registrationId: device.registrationId,
     contents,
   };
+}
+
+export async function decryptIncomingEnvelope({
+  envelope: rawEnvelope,
+  localAddress,
+  sealedSender,
+  stores,
+}: DecryptIncomingEnvelopeParams): Promise<DecryptedIncomingMessage> {
+  const envelope = rawEnvelope instanceof Uint8Array
+    ? decodeSignalEnvelope(rawEnvelope)
+    : rawEnvelope;
+  const encryptedContent = envelope.content;
+  if (!encryptedContent) {
+    throw new SignalTsUnsupportedError("Signal envelope does not contain encrypted content");
+  }
+  if (envelope.type === SignalEnvelopeType.UnidentifiedSender) {
+    return await decryptSealedSenderEnvelope({
+      envelope,
+      encryptedContent,
+      localAddress,
+      sealedSender,
+      stores,
+    });
+  }
+  const source = requireEnvelopeSource(envelope);
+  const remoteAddress = ProtocolAddress.new(Aci.fromUuid(source.serviceId), source.deviceId);
+  const plaintext = await decryptEnvelopeContent({
+    type: envelope.type,
+    encryptedContent,
+    remoteAddress,
+    localAddress,
+    stores,
+  });
+  return buildDecryptedIncomingMessage({ envelope, plaintext });
+}
+
+async function decryptSealedSenderEnvelope({
+  envelope,
+  encryptedContent,
+  localAddress,
+  sealedSender,
+  stores,
+}: {
+  envelope: SignalEnvelope;
+  encryptedContent: Bytes;
+  localAddress: ProtocolAddress;
+  sealedSender: SealedSenderDecryptOptions | undefined;
+  stores: DecryptIncomingEnvelopeParams["stores"];
+}): Promise<DecryptedIncomingMessage> {
+  const serverTimestamp = envelope.serverTimestamp ?? envelope.clientTimestamp ?? Date.now();
+  const trustRoots = sealedSender?.trustRoots ??
+    (sealedSender?.trustRoot ? [sealedSender.trustRoot] : getSignalUnidentifiedSenderTrustRoots());
+
+  const direct = await tryDecryptSealedSenderDeviceContent({
+    encryptedContent,
+    envelope,
+    trustRoots,
+    localAddress,
+    sealedSender,
+    stores,
+  });
+  const decrypted = direct ?? await decryptSealedSenderSenderKeyEnvelope({
+    encryptedContent,
+    localAddress,
+    serverTimestamp,
+    trustRoots,
+    stores,
+  });
+
+  const unsealedEnvelope: SignalEnvelope = {
+    ...envelope,
+    type: decrypted.envelopeType,
+    sourceServiceId: decrypted.senderUuid,
+    sourceDeviceId: decrypted.senderDeviceId,
+  };
+  if (decrypted.content !== undefined) {
+    unsealedEnvelope.content = decrypted.content;
+  } else {
+    delete unsealedEnvelope.content;
+  }
+  return {
+    envelope: unsealedEnvelope,
+    plaintext: decrypted.plaintext,
+    content: decodeDecryptedSignalContent(decrypted.plaintext),
+    sealedSender: {
+      ...(decrypted.senderAci ? { senderAci: decrypted.senderAci } : {}),
+      senderUuid: decrypted.senderUuid,
+      senderE164: decrypted.senderE164,
+      deviceId: decrypted.senderDeviceId,
+    },
+  };
+}
+
+async function decryptSealedSenderSenderKeyEnvelope({
+  encryptedContent,
+  localAddress,
+  serverTimestamp,
+  trustRoots,
+  stores,
+}: {
+  encryptedContent: Bytes;
+  localAddress: ProtocolAddress;
+  serverTimestamp: number;
+  trustRoots: PublicKey[];
+  stores: DecryptIncomingEnvelopeParams["stores"];
+}): Promise<DecryptedSealedSenderContent> {
+  const messageContent = await sealedSenderDecryptToUsmc(encryptedContent, stores.identityStore);
+  const certificate = messageContent.senderCertificate();
+  const trustRoot = trustRoots.find((root) => certificate.validateWithTrustRoots([root], serverTimestamp));
+  if (!trustRoot) {
+    throw new SignalTsUnsupportedError("Sealed sender certificate validation failed");
+  }
+
+  const senderAci = certificate.senderAci()?.getServiceIdString();
+  const senderUuid = certificate.senderUuid();
+  const senderDeviceId = certificate.senderDeviceId();
+  if (senderAci === localAddress.name() && senderDeviceId === localAddress.deviceId()) {
+    throw new SignalTsUnsupportedError("Received sealed sender message sent by this device");
+  }
+
+  const contentType = messageContent.msgType();
+  if (contentType !== CiphertextMessageType.SenderKey) {
+    if (contentType === CiphertextMessageType.Plaintext) {
+      return decryptSealedSenderPlaintextContent({
+        messageContent,
+        senderUuid,
+        senderDeviceId,
+      });
+    }
+    throw new SignalTsUnsupportedError(`Unsupported sealed sender content type: ${contentType}`);
+  }
+  return await decryptSealedSenderSenderKeyContent({
+    messageContent,
+    senderUuid,
+    senderDeviceId,
+    localAddress,
+    stores,
+  });
+}
+
+async function tryDecryptSealedSenderDeviceContent({
+  encryptedContent,
+  envelope,
+  trustRoots,
+  localAddress,
+  sealedSender,
+  stores,
+}: {
+  encryptedContent: Bytes;
+  envelope: SignalEnvelope;
+  trustRoots: PublicKey[];
+  localAddress: ProtocolAddress;
+  sealedSender: SealedSenderDecryptOptions | undefined;
+  stores: DecryptIncomingEnvelopeParams["stores"];
+}): Promise<DecryptedSealedSenderContent | null> {
+  for (const trustRoot of trustRoots) {
+    try {
+      return await decryptSealedSenderDeviceContent({
+        encryptedContent,
+        envelope,
+        trustRoot,
+        localAddress,
+        sealedSender,
+        stores,
+      });
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
+type DecryptedSealedSenderContent = {
+  content: Bytes | undefined;
+  envelopeType: SignalEnvelopeType;
+  plaintext: Bytes;
+  senderAci?: string;
+  senderUuid: string;
+  senderE164: string | null;
+  senderDeviceId: number;
+};
+
+async function decryptSealedSenderDeviceContent({
+  encryptedContent,
+  envelope,
+  trustRoot,
+  localAddress,
+  sealedSender,
+  stores,
+}: {
+  encryptedContent: Bytes;
+  envelope: SignalEnvelope;
+  trustRoot: PublicKey;
+  localAddress: ProtocolAddress;
+  sealedSender: SealedSenderDecryptOptions | undefined;
+  stores: DecryptIncomingEnvelopeParams["stores"];
+}): Promise<{
+  content: undefined;
+  envelopeType: SignalEnvelopeType.PlaintextContent;
+  plaintext: Bytes;
+  senderAci?: string;
+  senderUuid: string;
+  senderE164: string | null;
+  senderDeviceId: number;
+}> {
+  const result = await sealedSenderDecryptMessage(
+    encryptedContent,
+    trustRoot,
+    envelope.serverTimestamp ?? envelope.clientTimestamp ?? Date.now(),
+    sealedSender?.localE164 ?? null,
+    sealedSender?.localAci ?? localAddress.name(),
+    sealedSender?.localDeviceId ?? localAddress.deviceId(),
+    stores.sessionStore,
+    stores.identityStore,
+    stores.preKeyStore,
+    stores.signedPreKeyStore,
+    stores.kyberPreKeyStore,
+  );
+  const senderAci = result.senderAci()?.getServiceIdString();
+  return {
+    content: undefined,
+    envelopeType: SignalEnvelopeType.PlaintextContent,
+    plaintext: stripSignalMessagePadding(result.message()),
+    ...(senderAci ? { senderAci } : {}),
+    senderUuid: result.senderUuid(),
+    senderE164: result.senderE164(),
+    senderDeviceId: result.deviceId(),
+  };
+}
+
+async function decryptSealedSenderSenderKeyContent({
+  messageContent,
+  senderUuid,
+  senderDeviceId,
+  localAddress,
+  stores,
+}: {
+  messageContent: Awaited<ReturnType<typeof sealedSenderDecryptToUsmc>>;
+  senderUuid: string;
+  senderDeviceId: number;
+  localAddress: ProtocolAddress;
+  stores: DecryptIncomingEnvelopeParams["stores"];
+}): Promise<{
+  content: Bytes;
+  envelopeType: SignalEnvelopeType.SenderKey;
+  plaintext: Bytes;
+  senderAci?: string;
+  senderUuid: string;
+  senderE164: string | null;
+  senderDeviceId: number;
+}> {
+  if (!stores.senderKeyStore) {
+    throw new SignalTsUnsupportedError("Sealed sender sender-key content requires senderKeyStore");
+  }
+  const senderAci = messageContent.senderCertificate().senderAci()?.getServiceIdString();
+  const innerContent = copyBytes(messageContent.contents());
+  const remoteAddress = ProtocolAddress.new(Aci.fromUuid(senderUuid), senderDeviceId);
+  return {
+    content: innerContent,
+    envelopeType: SignalEnvelopeType.SenderKey,
+    plaintext: stripSignalMessagePadding(
+      await groupDecrypt(remoteAddress, stores.senderKeyStore, innerContent),
+    ),
+    ...(senderAci ? { senderAci } : {}),
+    senderUuid,
+    senderE164: messageContent.senderCertificate().senderE164(),
+    senderDeviceId,
+  };
+}
+
+function decryptSealedSenderPlaintextContent({
+  messageContent,
+  senderUuid,
+  senderDeviceId,
+}: {
+  messageContent: Awaited<ReturnType<typeof sealedSenderDecryptToUsmc>>;
+  senderUuid: string;
+  senderDeviceId: number;
+}): DecryptedSealedSenderContent {
+  const senderAci = messageContent.senderCertificate().senderAci()?.getServiceIdString();
+  return {
+    content: undefined,
+    envelopeType: SignalEnvelopeType.PlaintextContent,
+    plaintext: stripSignalMessagePadding(
+      PlaintextContent.deserialize(messageContent.contents()).body(),
+    ),
+    ...(senderAci ? { senderAci } : {}),
+    senderUuid,
+    senderE164: messageContent.senderCertificate().senderE164(),
+    senderDeviceId,
+  };
+}
+
+async function decryptEnvelopeContent({
+  type,
+  encryptedContent,
+  remoteAddress,
+  localAddress,
+  stores,
+}: {
+  type: SignalEnvelopeType | undefined;
+  encryptedContent: Bytes;
+  remoteAddress: ProtocolAddress;
+  localAddress: ProtocolAddress;
+  stores: DecryptIncomingEnvelopeParams["stores"];
+}): Promise<Bytes> {
+  if (type === SignalEnvelopeType.PreKeyMessage) {
+    return stripSignalMessagePadding(await signalDecryptPreKey(
+      PreKeySignalMessage.deserialize(encryptedContent),
+      remoteAddress,
+      localAddress,
+      stores.sessionStore,
+      stores.identityStore,
+      stores.preKeyStore,
+      stores.signedPreKeyStore,
+      stores.kyberPreKeyStore,
+    ));
+  }
+  if (type === SignalEnvelopeType.DoubleRatchet) {
+    return stripSignalMessagePadding(await signalDecrypt(
+      SignalMessage.deserialize(encryptedContent),
+      remoteAddress,
+      localAddress,
+      stores.sessionStore,
+      stores.identityStore,
+    ));
+  }
+  if (type === SignalEnvelopeType.SenderKey) {
+    if (!stores.senderKeyStore) {
+      throw new SignalTsUnsupportedError("Sender-key envelope requires senderKeyStore");
+    }
+    return stripSignalMessagePadding(
+      await groupDecrypt(remoteAddress, stores.senderKeyStore, encryptedContent),
+    );
+  }
+  if (type === SignalEnvelopeType.PlaintextContent) {
+    return stripSignalMessagePadding(PlaintextContent.deserialize(encryptedContent).body());
+  }
+  throw new SignalTsUnsupportedError(`Unsupported Signal envelope type: ${type ?? "missing"}`);
+}
+
+export function padSignalMessageBody(messageBody: Bytes): Bytes {
+  const paddedLength = getPaddedSignalMessageLength(messageBody.byteLength + 1) - 1;
+  const padded = new Uint8Array(paddedLength);
+  padded.set(messageBody);
+  padded[messageBody.byteLength] = 0x80;
+  return padded;
+}
+
+export function stripSignalMessagePadding(messageWithPadding: Bytes): Bytes {
+  for (let index = messageWithPadding.byteLength - 1; index >= 0; index -= 1) {
+    const byte = messageWithPadding[index]!;
+    if (byte === 0x80) {
+      return copyBytes(messageWithPadding.subarray(0, index));
+    }
+    if (byte !== 0x00) {
+      return copyBytes(messageWithPadding);
+    }
+  }
+  return new Uint8Array();
+}
+
+function getPaddedSignalMessageLength(messageLength: number): number {
+  const blockSize = 80;
+  const messageLengthWithTerminator = messageLength + 1;
+  return Math.ceil(messageLengthWithTerminator / blockSize) * blockSize;
+}
+
+function buildDecryptedIncomingMessage({
+  envelope,
+  plaintext,
+}: {
+  envelope: SignalEnvelope;
+  plaintext: Bytes;
+}): DecryptedIncomingMessage {
+  return {
+    envelope,
+    plaintext,
+    content: decodeDecryptedSignalContent(plaintext),
+  };
+}
+
+function decodeDecryptedSignalContent(plaintext: Bytes): SignalContent {
+  try {
+    return decodeSignalContent(plaintext);
+  } catch (err) {
+    throw new Error(
+      `Failed to decode decrypted Signal Content (plaintextLen=${plaintext.byteLength}): ${String(err)}`,
+    );
+  }
 }

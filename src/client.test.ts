@@ -86,7 +86,7 @@ describe("SignalTsClient", () => {
   });
 
   it("preserves the authenticated connection context while uploading attachments", async () => {
-    const uploadFetch = vi.fn(async (_input: string | URL, init?: RequestInit) => {
+    const uploadFetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       if (init?.method === "POST") {
         return new Response(null, {
           status: 200,

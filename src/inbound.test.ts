@@ -97,6 +97,36 @@ describe("Signal inbound normalization", () => {
     ]);
   });
 
+  it("normalizes raw decryption error message bytes from Content", () => {
+    const timestamp = 1_766_000_000_004;
+    const messages = normalizeSignalContent({
+      envelope,
+      content: {
+        decryptionErrorMessage: Uint8Array.from([
+          0x10,
+          0x84,
+          0xf8,
+          0xb5,
+          0xee,
+          0xb2,
+          0x33,
+          0x18,
+          0x02,
+        ]),
+      },
+    });
+
+    expect(messages).toEqual([
+      expect.objectContaining({
+        kind: "decryption-error",
+        decryptionError: {
+          timestamp,
+          deviceId: 2,
+        },
+      }),
+    ]);
+  });
+
   it("returns an unknown event for content without a supported high-level event", () => {
     expect(
       normalizeSignalContent({

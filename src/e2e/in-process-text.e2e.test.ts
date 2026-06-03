@@ -4,6 +4,7 @@ import {
   IdentityKeyPair,
   KEMKeyPair,
   KyberPreKeyRecord,
+  PlaintextContent,
   PreKeyBundle,
   PreKeyRecord,
   PrivateKey,
@@ -13,13 +14,17 @@ import {
   SignedPreKeyRecord,
   ServerCertificate,
   processSenderKeyDistributionMessage,
+  sealedSenderDecryptToUsmc,
 } from "@signalapp/libsignal-client";
 import type { SendMessageRequest } from "@signalapp/libsignal-client/dist/net/chat/AuthMessagesService.js";
 import { describe, expect, it, vi } from "vitest";
 import type { SignalAccountState } from "../account.js";
 import { copyBytes } from "../bytes.js";
 import { SignalTsClient, type SignalChatConnection, type SignalSealedSenderConnection } from "../client.js";
-import { decryptIncomingEnvelope } from "../crypto.js";
+import {
+  decryptIncomingEnvelope,
+  extractSignalDecryptionErrorMessageFromContent,
+} from "../crypto.js";
 import { InMemorySignalRepository } from "../memory-store.js";
 import { encodeSignalEnvelope, SignalEnvelopeType } from "../messages.js";
 import { createLibsignalStores, type LibsignalStores } from "../store.js";
@@ -141,11 +146,14 @@ describe("in-process message e2e", () => {
     });
     expect(
       (await decryptSentRequest({ request: requireSentRequest(sent, 1), sender, receiver })).content
-        .dataMessage?.reaction,
+        .dataMessage,
     ).toEqual({
-      emoji: "+1",
-      targetAuthorAci: receiver.account.device.aci,
-      targetSentTimestamp: 1_766_000_000_000,
+      timestamp: reactionTimestamp,
+      reaction: {
+        emoji: "+1",
+        targetAuthorAci: receiver.account.device.aci,
+        targetSentTimestamp: 1_766_000_000_000,
+      },
     });
     expect(
       (await decryptSentRequest({ request: requireSentRequest(sent, 2), sender, receiver })).content
@@ -160,6 +168,32 @@ describe("in-process message e2e", () => {
     ).toEqual({
       action: "started",
       timestamp: typingTimestamp,
+    });
+    await client.sendRetryReceiptMessage({
+      destination: receiver.account.device.aci,
+      retry: {
+        recipientServiceId: receiver.account.device.aci,
+        senderDeviceId: receiver.account.device.deviceId,
+        timestamp,
+        ciphertextType: deviceMessage.contents.type(),
+        originalContent: deviceMessage.contents.serialize(),
+      },
+      stores: sender.stores,
+      timestamp: timestamp + 4,
+    });
+    expect(sent).toHaveLength(5);
+    const retryDeviceMessage = requireSentRequest(sent, 4).contents[0];
+    if (!retryDeviceMessage) {
+      throw new Error("missing retry receipt device message");
+    }
+    expect(retryDeviceMessage.contents.type()).toBe(CiphertextMessageType.Plaintext);
+    expect(
+      extractSignalDecryptionErrorMessageFromContent(
+        PlaintextContent.deserialize(retryDeviceMessage.contents.serialize()).body(),
+      ),
+    ).toMatchObject({
+      timestamp,
+      deviceId: receiver.account.device.deviceId,
     });
   });
 
@@ -203,8 +237,24 @@ describe("in-process message e2e", () => {
       memberPreKeyBundles: new Map([[receiver.serviceId.getServiceIdString(), [receiver.preKeyBundle]]]),
       timestamp,
     });
+    await client.sendGroupReactionMessage({
+      members: [receiver.account.device.aci],
+      group: {
+        masterKey: groupMasterKey,
+        revision: 7,
+        distributionId,
+      },
+      reaction: {
+        emoji: "+1",
+        targetAuthorAci: receiver.account.device.aci,
+        targetSentTimestamp: timestamp,
+      },
+      stores: sender.stores,
+      memberPreKeyBundles: new Map([[receiver.serviceId.getServiceIdString(), [receiver.preKeyBundle]]]),
+      timestamp: timestamp + 1,
+    });
 
-    expect(sent).toHaveLength(2);
+    expect(sent).toHaveLength(4);
     const distribution = await decryptSentRequest({
       request: requireSentRequest(sent, 0),
       sender,
@@ -237,6 +287,46 @@ describe("in-process message e2e", () => {
     expect(inboundGroup.content.dataMessage).toEqual({
       body: "hello group",
       timestamp,
+      groupV2: {
+        masterKey: groupMasterKey,
+        revision: 7,
+      },
+    });
+    const reactionDistribution = await decryptSentRequest({
+      request: requireSentRequest(sent, 2),
+      sender,
+      receiver,
+    });
+    const reactionDistributionBytes = reactionDistribution.content.senderKeyDistributionMessage;
+    if (!reactionDistributionBytes) {
+      throw new Error("missing reaction sender key distribution message");
+    }
+    await processSenderKeyDistributionMessage(
+      sender.localAddress,
+      SenderKeyDistributionMessage.deserialize(reactionDistributionBytes),
+      receiver.stores.senderKeyStore,
+    );
+    const groupReactionDeviceMessage = requireSentRequest(sent, 3).contents[0];
+    if (!groupReactionDeviceMessage) {
+      throw new Error("missing group reaction device message");
+    }
+    const inboundGroupReaction = await decryptIncomingEnvelope({
+      envelope: {
+        type: SignalEnvelopeType.SenderKey,
+        sourceServiceId: sender.account.device.aci,
+        sourceDeviceId: sender.account.device.deviceId,
+        content: groupReactionDeviceMessage.contents.serialize(),
+      },
+      localAddress: receiver.localAddress,
+      stores: receiver.stores,
+    });
+    expect(inboundGroupReaction.content.dataMessage).toEqual({
+      timestamp: timestamp + 1,
+      reaction: {
+        emoji: "+1",
+        targetAuthorAci: receiver.account.device.aci,
+        targetSentTimestamp: timestamp,
+      },
       groupV2: {
         masterKey: groupMasterKey,
         revision: 7,
@@ -279,7 +369,6 @@ describe("in-process message e2e", () => {
       preKeyBundles: [receiver.preKeyBundle],
       timestamp,
     });
-
     const request = sealedSent[0];
     const deviceMessage = request?.contents[0];
     if (!deviceMessage) {
@@ -310,6 +399,73 @@ describe("in-process message e2e", () => {
       deviceId: sender.account.device.deviceId,
     });
     expect(decrypted.content.dataMessage).toEqual({ body, timestamp });
+
+    const receiverSent: SendMessageRequest[] = [];
+    const receiverConnection: SignalChatConnection = {
+      sendMessage: async (request) => {
+        receiverSent.push(request);
+      },
+      disconnect: vi.fn(async () => {}),
+      connectionInfo: () => ({ localPort: 2, ipVersion: "IPv4", toString: () => "fake" }),
+    };
+    const receiverClient = new SignalTsClient({
+      account: receiver.account,
+      connectionFactory: async () => receiverConnection,
+    });
+    const responseTimestamp = timestamp + 1;
+    await receiverClient.connect();
+    await receiverClient.sendMessage({
+      destination: sender.account.device.aci,
+      body: "receiver response",
+      stores: receiver.stores,
+      preKeyBundles: [sender.preKeyBundle],
+      timestamp: responseTimestamp,
+    });
+    await decryptSentRequest({
+      request: requireSentRequest(receiverSent, 0),
+      sender: receiver,
+      receiver: sender,
+    });
+
+    const secondTimestamp = timestamp + 2;
+    const secondBody = "sealed followup";
+    await client.sendSealedContentMessage({
+      destination: receiver.account.device.aci,
+      content: { dataMessage: { body: secondBody, timestamp: secondTimestamp } },
+      senderCertificate: certificate,
+      stores: sender.stores,
+      preKeyBundles: [receiver.preKeyBundle],
+      timestamp: secondTimestamp,
+    });
+
+    const secondDeviceMessage = sealedSent[1]?.contents[0];
+    if (!secondDeviceMessage) {
+      throw new Error("missing sealed followup outbound device message");
+    }
+    expect(
+      (await sealedSenderDecryptToUsmc(secondDeviceMessage.contents, receiver.stores.identityStore))
+        .msgType(),
+    ).toBe(CiphertextMessageType.Whisper);
+    const secondDecrypted = await decryptIncomingEnvelope({
+      envelope: encodeSignalEnvelope({
+        type: SignalEnvelopeType.UnidentifiedSender,
+        clientTimestamp: secondTimestamp,
+        content: copyBytes(secondDeviceMessage.contents),
+        destinationServiceId: receiver.account.device.aci,
+        urgent: true,
+      }),
+      localAddress: receiver.localAddress,
+      sealedSender: {
+        trustRoot,
+        localAci: receiver.account.device.aci,
+        localDeviceId: receiver.account.device.deviceId + 1,
+      },
+      stores: receiver.stores,
+    });
+    expect(secondDecrypted.content.dataMessage).toEqual({
+      body: secondBody,
+      timestamp: secondTimestamp,
+    });
   });
 });
 

@@ -27,7 +27,12 @@ import {
   type EncryptedSignalAttachment,
   type SignalAttachmentInput,
 } from "./attachments.js";
-import { encryptPayloadForDevice, padSignalMessageBody } from "./crypto.js";
+import {
+  createSignalDecryptionErrorPlaintextContent,
+  encryptPayloadForDevice,
+  padSignalMessageBody,
+  type SignalRetryReceiptRequest,
+} from "./crypto.js";
 import { SignalEventHub } from "./events.js";
 import type { SignalEventHandler, SignalEventName } from "./events.js";
 import { SignalTsStateError } from "./errors.js";
@@ -154,6 +159,11 @@ export type SendContentMessageParams = {
   content: SignalContent;
 } & SendContentMessageBaseParams;
 
+export type SendRetryReceiptMessageParams = {
+  destination: SignalRecipientTarget;
+  retry: SignalRetryReceiptRequest;
+} & Omit<SendContentMessageBaseParams, "preKeyBundles" | "preKeyAuth">;
+
 export type SendSealedContentMessageParams = {
   destination: SignalRecipientTarget;
   content: SignalContent;
@@ -222,6 +232,17 @@ export type SendGroupMessageParams = SignalGroupMessageTarget & {
 
 export type SendGroupStickerMessageParams = SignalGroupMessageTarget & {
   sticker: SignalSticker;
+  stores: Pick<LibsignalStores, "identityStore" | "sessionStore" | "senderKeyStore">;
+  memberPreKeyBundles?: ReadonlyMap<string, PreKeyBundle[]>;
+  preKeyAuth?: PreKeyAuth;
+  timestamp?: number;
+  onlineOnly?: boolean;
+  urgent?: boolean;
+  abortSignal?: AbortSignal;
+};
+
+export type SendGroupReactionMessageParams = SignalGroupMessageTarget & {
+  reaction: SignalReaction;
   stores: Pick<LibsignalStores, "identityStore" | "sessionStore" | "senderKeyStore">;
   memberPreKeyBundles?: ReadonlyMap<string, PreKeyBundle[]>;
   preKeyAuth?: PreKeyAuth;
@@ -349,9 +370,11 @@ export class SignalTsClient {
   }
 
   async sendReactionMessage(params: SendReactionMessageParams): Promise<{ timestamp: number }> {
+    const timestamp = params.timestamp ?? Date.now();
     return await this.sendContentMessage({
       ...params,
-      content: createReactionSignalContent(params.reaction),
+      timestamp,
+      content: createReactionSignalContent(params.reaction, { timestamp }),
     });
   }
 
@@ -449,6 +472,34 @@ export class SignalTsClient {
       sendParams.abortSignal = params.abortSignal;
     }
     return await this.sendEncryptedMessage(sendParams);
+  }
+
+  async sendRetryReceiptMessage(
+    params: SendRetryReceiptMessageParams,
+  ): Promise<{ timestamp: number }> {
+    const timestamp = params.timestamp ?? Date.now();
+    const destination = await this.resolveRecipient(params.destination, params.abortSignal);
+    const remoteAddress = ProtocolAddress.new(destination, params.retry.senderDeviceId);
+    const session = await params.stores.sessionStore.getSession(remoteAddress);
+    if (!session) {
+      throw new SignalTsStateError(
+        `Signal session is missing for retry receipt recipient ${destination.getServiceIdString()}.${params.retry.senderDeviceId}`,
+      );
+    }
+    return await this.sendEncryptedMessage({
+      destination,
+      timestamp,
+      contents: [
+        {
+          deviceId: params.retry.senderDeviceId,
+          registrationId: session.remoteRegistrationId(),
+          contents: createSignalDecryptionErrorPlaintextContent(params.retry).asCiphertextMessage(),
+        },
+      ],
+      ...(params.onlineOnly !== undefined ? { onlineOnly: params.onlineOnly } : {}),
+      ...(params.urgent !== undefined ? { urgent: params.urgent } : {}),
+      ...(params.abortSignal ? { abortSignal: params.abortSignal } : {}),
+    });
   }
 
   async sendSealedContentMessage(
@@ -619,6 +670,24 @@ export class SignalTsClient {
       timestamp,
       content: createStickerSignalContent({
         sticker: params.sticker,
+        timestamp,
+        groupV2: {
+          masterKey: params.group.masterKey,
+          ...(params.group.revision !== undefined ? { revision: params.group.revision } : {}),
+        },
+      }),
+    });
+  }
+
+  async sendGroupReactionMessage(params: SendGroupReactionMessageParams): Promise<{
+    timestamp: number;
+    recipients: number;
+  }> {
+    const timestamp = params.timestamp ?? Date.now();
+    return await this.sendGroupContentMessage({
+      ...params,
+      timestamp,
+      content: createReactionSignalContent(params.reaction, {
         timestamp,
         groupV2: {
           masterKey: params.group.masterKey,

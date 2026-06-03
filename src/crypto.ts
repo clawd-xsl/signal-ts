@@ -2,6 +2,7 @@ import {
   Aci,
   CiphertextMessageType,
   CiphertextMessage,
+  DecryptionErrorMessage,
   PlaintextContent,
   PreKeySignalMessage,
   ProtocolAddress,
@@ -85,6 +86,25 @@ export type DecryptedIncomingMessage = {
   };
 };
 
+export type SignalRetryReceiptRequest = {
+  recipientServiceId: string;
+  senderDeviceId: number;
+  timestamp: number;
+  ciphertextType: number;
+  originalContent: Bytes;
+  groupId?: Bytes;
+};
+
+export class SignalTsDecryptionError extends Error {
+  readonly retryReceipt: SignalRetryReceiptRequest | undefined;
+
+  constructor(message: string, options: { cause: unknown; retryReceipt?: SignalRetryReceiptRequest }) {
+    super(message, { cause: options.cause });
+    this.name = "SignalTsDecryptionError";
+    this.retryReceipt = options.retryReceipt;
+  }
+}
+
 export async function encryptPayloadForDevice({
   localAddress,
   device,
@@ -142,13 +162,25 @@ export async function decryptIncomingEnvelope({
   }
   const source = requireEnvelopeSource(envelope);
   const remoteAddress = ProtocolAddress.new(Aci.fromUuid(source.serviceId), source.deviceId);
-  const plaintext = await decryptEnvelopeContent({
-    type: envelope.type,
-    encryptedContent,
-    remoteAddress,
-    localAddress,
-    stores,
-  });
+  let plaintext: Bytes;
+  try {
+    plaintext = await decryptEnvelopeContent({
+      type: envelope.type,
+      encryptedContent,
+      remoteAddress,
+      localAddress,
+      stores,
+    });
+  } catch (err) {
+    throw createSignalTsDecryptionError({
+      err,
+      envelope,
+      originalContent: encryptedContent,
+      ciphertextType: envelopeTypeToCiphertextMessageType(envelope.type),
+      recipientServiceId: source.serviceId,
+      senderDeviceId: source.deviceId,
+    });
+  }
   return buildDecryptedIncomingMessage({ envelope, plaintext });
 }
 
@@ -243,6 +275,15 @@ async function decryptSealedSenderSenderKeyEnvelope({
         messageContent,
         senderUuid,
         senderDeviceId,
+      });
+    }
+    if (contentType === CiphertextMessageType.Whisper || contentType === CiphertextMessageType.PreKey) {
+      return await decryptSealedSenderSessionContent({
+        messageContent,
+        senderUuid,
+        senderDeviceId,
+        localAddress,
+        stores,
       });
     }
     throw new SignalTsUnsupportedError(`Unsupported sealed sender content type: ${contentType}`);
@@ -344,6 +385,81 @@ async function decryptSealedSenderDeviceContent({
     senderE164: result.senderE164(),
     senderDeviceId: result.deviceId(),
   };
+}
+
+async function decryptSealedSenderSessionContent({
+  messageContent,
+  senderUuid,
+  senderDeviceId,
+  localAddress,
+  stores,
+}: {
+  messageContent: Awaited<ReturnType<typeof sealedSenderDecryptToUsmc>>;
+  senderUuid: string;
+  senderDeviceId: number;
+  localAddress: ProtocolAddress;
+  stores: DecryptIncomingEnvelopeParams["stores"];
+}): Promise<{
+  content: Bytes;
+  envelopeType: SignalEnvelopeType.PreKeyMessage | SignalEnvelopeType.DoubleRatchet;
+  plaintext: Bytes;
+  senderAci?: string;
+  senderUuid: string;
+  senderE164: string | null;
+  senderDeviceId: number;
+}> {
+  const certificate = messageContent.senderCertificate();
+  const senderAci = certificate.senderAci()?.getServiceIdString();
+  const innerContent = copyBytes(messageContent.contents());
+  const contentType = messageContent.msgType();
+  const remoteAddress = ProtocolAddress.new(Aci.fromUuid(senderUuid), senderDeviceId);
+  try {
+    if (contentType === CiphertextMessageType.PreKey) {
+      return {
+        content: innerContent,
+        envelopeType: SignalEnvelopeType.PreKeyMessage,
+        plaintext: stripSignalMessagePadding(await signalDecryptPreKey(
+          PreKeySignalMessage.deserialize(innerContent),
+          remoteAddress,
+          localAddress,
+          stores.sessionStore,
+          stores.identityStore,
+          stores.preKeyStore,
+          stores.signedPreKeyStore,
+          stores.kyberPreKeyStore,
+        )),
+        ...(senderAci ? { senderAci } : {}),
+        senderUuid,
+        senderE164: certificate.senderE164(),
+        senderDeviceId,
+      };
+    }
+    return {
+      content: innerContent,
+      envelopeType: SignalEnvelopeType.DoubleRatchet,
+      plaintext: stripSignalMessagePadding(await signalDecrypt(
+        SignalMessage.deserialize(innerContent),
+        remoteAddress,
+        localAddress,
+        stores.sessionStore,
+        stores.identityStore,
+      )),
+      ...(senderAci ? { senderAci } : {}),
+      senderUuid,
+      senderE164: certificate.senderE164(),
+      senderDeviceId,
+    };
+  } catch (err) {
+    const groupId = messageContent.groupId();
+    throw createSignalTsDecryptionError({
+      err,
+      originalContent: innerContent,
+      ciphertextType: contentType,
+      recipientServiceId: senderUuid,
+      senderDeviceId,
+      ...(groupId ? { groupId } : {}),
+    });
+  }
 }
 
 async function decryptSealedSenderSenderKeyContent({
@@ -457,6 +573,50 @@ async function decryptEnvelopeContent({
   throw new SignalTsUnsupportedError(`Unsupported Signal envelope type: ${type ?? "missing"}`);
 }
 
+export function createSignalDecryptionErrorPlaintextContent(
+  retry: SignalRetryReceiptRequest,
+): PlaintextContent {
+  return PlaintextContent.from(
+    DecryptionErrorMessage.forOriginal(
+      retry.originalContent,
+      retry.ciphertextType as CiphertextMessageType,
+      retry.timestamp,
+      retry.senderDeviceId,
+    ),
+  );
+}
+
+export function decodeSignalDecryptionErrorMessage(bytes: Bytes): {
+  timestamp: number;
+  deviceId: number;
+  ratchetKey?: PublicKey;
+} {
+  return normalizeSignalDecryptionErrorMessage(DecryptionErrorMessage.deserialize(bytes));
+}
+
+export function extractSignalDecryptionErrorMessageFromContent(bytes: Bytes): {
+  timestamp: number;
+  deviceId: number;
+  ratchetKey?: PublicKey;
+} {
+  return normalizeSignalDecryptionErrorMessage(
+    DecryptionErrorMessage.extractFromSerializedBody(bytes),
+  );
+}
+
+function normalizeSignalDecryptionErrorMessage(message: DecryptionErrorMessage): {
+  timestamp: number;
+  deviceId: number;
+  ratchetKey?: PublicKey;
+} {
+  const ratchetKey = message.ratchetKey();
+  return {
+    timestamp: message.timestamp(),
+    deviceId: message.deviceId(),
+    ...(ratchetKey ? { ratchetKey } : {}),
+  };
+}
+
 export function padSignalMessageBody(messageBody: Bytes): Bytes {
   const paddedLength = getPaddedSignalMessageLength(messageBody.byteLength + 1) - 1;
   const padded = new Uint8Array(paddedLength);
@@ -506,4 +666,52 @@ function decodeDecryptedSignalContent(plaintext: Bytes): SignalContent {
       `Failed to decode decrypted Signal Content (plaintextLen=${plaintext.byteLength}): ${String(err)}`,
     );
   }
+}
+
+function createSignalTsDecryptionError({
+  err,
+  envelope,
+  originalContent,
+  ciphertextType,
+  recipientServiceId,
+  senderDeviceId,
+  groupId,
+}: {
+  err: unknown;
+  envelope?: SignalEnvelope;
+  originalContent: Bytes;
+  ciphertextType: number;
+  recipientServiceId: string;
+  senderDeviceId: number;
+  groupId?: Bytes;
+}): SignalTsDecryptionError {
+  const timestamp = envelope?.clientTimestamp ?? envelope?.serverTimestamp ?? Date.now();
+  const retryReceipt: SignalRetryReceiptRequest = {
+    recipientServiceId,
+    senderDeviceId,
+    timestamp,
+    ciphertextType,
+    originalContent: copyBytes(originalContent),
+  };
+  if (groupId !== undefined) {
+    retryReceipt.groupId = copyBytes(groupId);
+  }
+  const message = err instanceof Error ? err.message : String(err);
+  return new SignalTsDecryptionError(`Failed to decrypt Signal message: ${message}`, {
+    cause: err,
+    retryReceipt,
+  });
+}
+
+function envelopeTypeToCiphertextMessageType(type: SignalEnvelopeType | undefined): number {
+  if (type === SignalEnvelopeType.PreKeyMessage) {
+    return CiphertextMessageType.PreKey;
+  }
+  if (type === SignalEnvelopeType.SenderKey || type === SignalEnvelopeType.UnidentifiedSender) {
+    return CiphertextMessageType.SenderKey;
+  }
+  if (type === SignalEnvelopeType.PlaintextContent) {
+    return CiphertextMessageType.Plaintext;
+  }
+  return CiphertextMessageType.Whisper;
 }

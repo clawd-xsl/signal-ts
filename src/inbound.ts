@@ -1,6 +1,6 @@
 import { GroupMasterKey, GroupSecretParams } from "@signalapp/libsignal-client/dist/zkgroup/index.js";
 import { bytesToBase64, copyBytes, type Bytes } from "./bytes.js";
-import type { DecryptedIncomingMessage } from "./crypto.js";
+import { decodeSignalDecryptionErrorMessage, type DecryptedIncomingMessage } from "./crypto.js";
 import {
   requireEnvelopeSource,
   type SignalContent,
@@ -69,6 +69,15 @@ export type SignalIncomingSyncMessage = SignalIncomingBase & {
   syncMessage: Record<string, unknown>;
 };
 
+export type SignalIncomingDecryptionErrorMessage = SignalIncomingBase & {
+  kind: "decryption-error";
+  decryptionError: {
+    timestamp: number;
+    deviceId: number;
+    ratchetKey?: Bytes;
+  };
+};
+
 export type SignalIncomingUnknownMessage = SignalIncomingBase & {
   kind: "unknown";
   content: SignalContent;
@@ -81,6 +90,7 @@ export type SignalIncomingMessage =
   | SignalIncomingReceiptMessage
   | SignalIncomingTypingMessage
   | SignalIncomingSyncMessage
+  | SignalIncomingDecryptionErrorMessage
   | SignalIncomingUnknownMessage;
 
 export function normalizeDecryptedIncomingMessage(
@@ -151,6 +161,20 @@ export function normalizeSignalContent({
       ...base,
       kind: "sync",
       syncMessage: content.syncMessage,
+    });
+  }
+  if (content.decryptionErrorMessage) {
+    const decryptionError = decodeSignalDecryptionErrorMessage(content.decryptionErrorMessage);
+    messages.push({
+      ...base,
+      kind: "decryption-error",
+      decryptionError: {
+        timestamp: decryptionError.timestamp,
+        deviceId: decryptionError.deviceId,
+        ...(decryptionError.ratchetKey
+          ? { ratchetKey: copyBytes(decryptionError.ratchetKey.serialize()) }
+          : {}),
+      },
     });
   }
   if (messages.length === 0) {

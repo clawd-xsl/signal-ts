@@ -34,6 +34,7 @@ import { SignalTsStateError } from "./errors.js";
 import {
   createReactionSignalContent,
   createReceiptSignalContent,
+  createStickerSignalContent,
   createTextSignalContent,
   createTypingSignalContent,
   encodeSignalContent,
@@ -44,6 +45,7 @@ import {
   type SignalQuote,
   type SignalReaction,
   type SignalReceiptMessage,
+  type SignalSticker,
   type SignalTypingMessage,
 } from "./messages.js";
 import { fetchRecipientPreKeys, type FetchPreKeysParams, type PreKeyAuth } from "./prekeys.js";
@@ -142,6 +144,11 @@ export type SendContentMessageBaseParams = {
   abortSignal?: AbortSignal;
 };
 
+export type SendStickerMessageParams = {
+  destination: SignalRecipientTarget;
+  sticker: SignalSticker;
+} & SendContentMessageBaseParams;
+
 export type SendContentMessageParams = {
   destination: SignalRecipientTarget;
   content: SignalContent;
@@ -190,17 +197,42 @@ export type SendTypingMessageParams = {
   typing: SignalTypingMessage;
 } & SendContentMessageBaseParams;
 
-export type SendGroupMessageParams = {
+export type SignalGroupMessageTarget = {
   members: SignalRecipientTarget[];
   group: {
     masterKey: Uint8Array<ArrayBuffer>;
     revision?: number;
     distributionId: string;
   };
+};
+
+export type SendGroupMessageParams = SignalGroupMessageTarget & {
   body?: string;
   attachments?: SignalAttachmentPointer[];
   quote?: SignalQuote;
   bodyRanges?: SignalBodyRange[];
+  stores: Pick<LibsignalStores, "identityStore" | "sessionStore" | "senderKeyStore">;
+  memberPreKeyBundles?: ReadonlyMap<string, PreKeyBundle[]>;
+  preKeyAuth?: PreKeyAuth;
+  timestamp?: number;
+  onlineOnly?: boolean;
+  urgent?: boolean;
+  abortSignal?: AbortSignal;
+};
+
+export type SendGroupStickerMessageParams = SignalGroupMessageTarget & {
+  sticker: SignalSticker;
+  stores: Pick<LibsignalStores, "identityStore" | "sessionStore" | "senderKeyStore">;
+  memberPreKeyBundles?: ReadonlyMap<string, PreKeyBundle[]>;
+  preKeyAuth?: PreKeyAuth;
+  timestamp?: number;
+  onlineOnly?: boolean;
+  urgent?: boolean;
+  abortSignal?: AbortSignal;
+};
+
+type SendGroupContentMessageParams = SignalGroupMessageTarget & {
+  content: SignalContent;
   stores: Pick<LibsignalStores, "identityStore" | "sessionStore" | "senderKeyStore">;
   memberPreKeyBundles?: ReadonlyMap<string, PreKeyBundle[]>;
   preKeyAuth?: PreKeyAuth;
@@ -343,6 +375,18 @@ export class SignalTsClient {
     return await this.sendContentMessage({
       ...params,
       content: createTypingSignalContent(typing),
+    });
+  }
+
+  async sendStickerMessage(params: SendStickerMessageParams): Promise<{ timestamp: number }> {
+    const timestamp = params.timestamp ?? Date.now();
+    return await this.sendContentMessage({
+      ...params,
+      timestamp,
+      content: createStickerSignalContent({
+        sticker: params.sticker,
+        timestamp,
+      }),
     });
   }
 
@@ -541,6 +585,54 @@ export class SignalTsClient {
       throw new SignalTsStateError("Signal group message requires body or attachments");
     }
     const timestamp = params.timestamp ?? Date.now();
+    const contentParams: Parameters<typeof createTextSignalContent>[0] = {
+      body: params.body ?? "",
+      timestamp,
+      groupV2: {
+        masterKey: params.group.masterKey,
+        ...(params.group.revision !== undefined ? { revision: params.group.revision } : {}),
+      },
+    };
+    if (params.attachments !== undefined) {
+      contentParams.attachments = params.attachments;
+    }
+    if (params.quote !== undefined) {
+      contentParams.quote = params.quote;
+    }
+    if (params.bodyRanges !== undefined) {
+      contentParams.bodyRanges = params.bodyRanges;
+    }
+    return await this.sendGroupContentMessage({
+      ...params,
+      timestamp,
+      content: createTextSignalContent(contentParams),
+    });
+  }
+
+  async sendGroupStickerMessage(params: SendGroupStickerMessageParams): Promise<{
+    timestamp: number;
+    recipients: number;
+  }> {
+    const timestamp = params.timestamp ?? Date.now();
+    return await this.sendGroupContentMessage({
+      ...params,
+      timestamp,
+      content: createStickerSignalContent({
+        sticker: params.sticker,
+        timestamp,
+        groupV2: {
+          masterKey: params.group.masterKey,
+          ...(params.group.revision !== undefined ? { revision: params.group.revision } : {}),
+        },
+      }),
+    });
+  }
+
+  private async sendGroupContentMessage(params: SendGroupContentMessageParams): Promise<{
+    timestamp: number;
+    recipients: number;
+  }> {
+    const timestamp = params.timestamp ?? Date.now();
     const localAddress = ProtocolAddress.new(
       Aci.fromUuid(this.options.account.device.aci),
       this.options.account.device.deviceId,
@@ -576,28 +668,11 @@ export class SignalTsClient {
         return { destination, bundles };
       }),
     );
-    const contentParams: Parameters<typeof createTextSignalContent>[0] = {
-      body: params.body ?? "",
-      timestamp,
-      groupV2: {
-        masterKey: params.group.masterKey,
-        ...(params.group.revision !== undefined ? { revision: params.group.revision } : {}),
-      },
-    };
-    if (params.attachments !== undefined) {
-      contentParams.attachments = params.attachments;
-    }
-    if (params.quote !== undefined) {
-      contentParams.quote = params.quote;
-    }
-    if (params.bodyRanges !== undefined) {
-      contentParams.bodyRanges = params.bodyRanges;
-    }
     const groupCiphertext = await groupEncrypt(
       localAddress,
       params.group.distributionId,
       params.stores.senderKeyStore,
-      padSignalMessageBody(encodeSignalContent(createTextSignalContent(contentParams))),
+      padSignalMessageBody(encodeSignalContent(params.content)),
     );
     await Promise.all(
       memberBundles.map(async ({ destination, bundles }) => {
@@ -626,8 +701,10 @@ export class SignalTsClient {
     if (!connection.getUploadForm) {
       throw new SignalTsStateError("Signal chat connection does not support attachment uploads");
     }
+    const getUploadForm: AttachmentUploadConnection["getUploadForm"] = (request, options) =>
+      connection.getUploadForm!.call(connection, request, options);
     return await uploadSignalAttachment({
-      connection: { getUploadForm: connection.getUploadForm },
+      connection: { getUploadForm },
       attachment: params.attachment,
       ...(params.fetch ? { fetch: params.fetch } : {}),
       ...(params.abortSignal ? { abortSignal: params.abortSignal } : {}),

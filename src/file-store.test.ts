@@ -43,6 +43,20 @@ describe("FileSignalRepository", () => {
       distributionId: "44444444-4444-4444-8444-444444444444",
       members: ["11111111-1111-4111-8111-111111111111"],
     });
+    await repository.setStickerPack({
+      id: "aabb",
+      key: "pack-key",
+      installed: true,
+      title: "stickers",
+      stickers: {
+        "5": {
+          id: 5,
+          fileName: "5",
+          contentType: "image/webp",
+          size: 42,
+        },
+      },
+    });
 
     const restored = await FileSignalRepository.open(filePath);
 
@@ -55,6 +69,13 @@ describe("FileSignalRepository", () => {
       "11111111-1111-4111-8111-111111111111.2",
     );
     expect((await restored.getGroup("group-id"))?.masterKey).toBe("master");
+    expect((await restored.getStickerPack("AABB"))?.stickers["5"]).toMatchObject({
+      id: 5,
+      fileName: "5",
+      contentType: "image/webp",
+      size: 42,
+    });
+    expect(restored.getStickerFilePath("aabb", "5")).toBe(join(filePath + ".stickers", "aabb", "5"));
     expect(JSON.parse(await readFile(filePath, "utf-8"))).toMatchObject({ version: 1 });
   });
 });

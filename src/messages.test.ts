@@ -12,6 +12,7 @@ import {
   encodeSignalProvisionEnvelope,
   encodeSignalProvisionMessage,
   createReceiptSignalContent,
+  createStickerSignalContent,
   createTypingSignalContent,
   SignalEnvelopeType,
 } from "./messages.js";
@@ -56,6 +57,50 @@ describe("Signal protobuf messages", () => {
         action: "started",
         timestamp: 789,
         groupId: Uint8Array.from([1, 2, 3]),
+      },
+    });
+  });
+
+  it("roundtrips sticker content through DataMessage.sticker", () => {
+    expect(
+      decodeSignalContent(
+        encodeSignalContent(
+          createStickerSignalContent({
+            timestamp: 1_766_000_000_003,
+            sticker: {
+              packId: Uint8Array.from([0xaa, 0xbb]),
+              packKey: Uint8Array.from([0xcc, 0xdd]),
+              stickerId: 5,
+              data: {
+                cdnKey: "cdn-key",
+                cdnNumber: 3,
+                key: Uint8Array.from([1, 2, 3]),
+                digest: Uint8Array.from([4, 5, 6]),
+                contentType: "image/webp",
+                size: 42,
+              },
+              emoji: "x",
+            },
+          }),
+        ),
+      ),
+    ).toEqual({
+      dataMessage: {
+        timestamp: 1_766_000_000_003,
+        sticker: {
+          packId: Uint8Array.from([0xaa, 0xbb]),
+          packKey: Uint8Array.from([0xcc, 0xdd]),
+          stickerId: 5,
+          data: {
+            cdnKey: "cdn-key",
+            cdnNumber: 3,
+            key: Uint8Array.from([1, 2, 3]),
+            digest: Uint8Array.from([4, 5, 6]),
+            contentType: "image/webp",
+            size: 42,
+          },
+          emoji: "x",
+        },
       },
     });
   });

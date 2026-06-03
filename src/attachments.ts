@@ -231,9 +231,29 @@ async function uploadEncryptedAttachment({
   fetch: FetchLike;
   abortSignal?: AbortSignal;
 }): Promise<void> {
+  if (uploadForm.cdn === 3) {
+    const uploadParams: Parameters<typeof uploadEncryptedAttachmentToCdn3>[0] = {
+      uploadForm,
+      encrypted,
+      fetch: fetchImpl,
+    };
+    if (abortSignal) {
+      uploadParams.abortSignal = abortSignal;
+    }
+    await uploadEncryptedAttachmentToCdn3(uploadParams);
+    return;
+  }
+  if (uploadForm.cdn !== 2) {
+    throw new SignalTsStateError(`Unsupported Signal attachment CDN: ${uploadForm.cdn}`);
+  }
   const postInit: RequestInit = {
     method: "POST",
-    headers: uploadHeaders(uploadForm.headers),
+    headers: {
+      ...uploadHeaders(uploadForm.headers, { omitHost: true }),
+      "Content-Length": "0",
+      "Content-Type": "application/octet-stream",
+    },
+    body: new Uint8Array(0),
     redirect: "error",
   };
   if (abortSignal) {
@@ -250,7 +270,8 @@ async function uploadEncryptedAttachment({
   const putInit: RequestInit = {
     method: "PUT",
     headers: {
-      "Content-Range": `bytes 0-*/${encrypted.byteLength}`,
+      "Content-Range": `bytes 0-${encrypted.byteLength - 1}/${encrypted.byteLength}`,
+      "Content-Type": "application/octet-stream",
     },
     body: encrypted,
     redirect: "error",
@@ -261,6 +282,37 @@ async function uploadEncryptedAttachment({
   const putResponse = await fetchImpl(uploadLocation, putInit);
   if (!putResponse.ok) {
     throw new SignalTsStateError(`Signal attachment upload failed: HTTP ${putResponse.status}`);
+  }
+}
+
+async function uploadEncryptedAttachmentToCdn3({
+  uploadForm,
+  encrypted,
+  fetch: fetchImpl,
+  abortSignal,
+}: {
+  uploadForm: UploadForm;
+  encrypted: Bytes;
+  fetch: FetchLike;
+  abortSignal?: AbortSignal;
+}): Promise<void> {
+  const init: RequestInit = {
+    method: "POST",
+    headers: {
+      ...uploadHeaders(uploadForm.headers, { omitHost: true }),
+      "Content-Type": "application/offset+octet-stream",
+      "Tus-Resumable": "1.0.0",
+      "Upload-Length": String(encrypted.byteLength),
+    },
+    body: encrypted,
+    redirect: "error",
+  };
+  if (abortSignal) {
+    init.signal = abortSignal;
+  }
+  const response = await fetchImpl(uploadForm.signedUploadUrl, init);
+  if (!response.ok) {
+    throw new SignalTsStateError(`Signal attachment upload failed: HTTP ${response.status}`);
   }
 }
 
@@ -367,8 +419,14 @@ function bytesToHex(bytes: Bytes): string {
   return Buffer.from(bytes).toString("hex");
 }
 
-function uploadHeaders(headers: Map<string, string>): HeadersInit {
-  return Object.fromEntries(headers.entries());
+function uploadHeaders(
+  headers: Map<string, string>,
+  options: { omitHost?: boolean } = {},
+): Record<string, string> {
+  const entries = [...headers.entries()].filter(
+    ([key]) => !(options.omitHost === true && key.toLowerCase() === "host"),
+  );
+  return Object.fromEntries(entries);
 }
 
 function joinUrlPath(...parts: string[]): string {

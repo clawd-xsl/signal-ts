@@ -72,7 +72,7 @@ describe("Signal attachments", () => {
     expect(encrypted.pointer.chunkSize).toBeGreaterThan(0);
   });
 
-  it("uploads encrypted attachments through Signal's resumable form flow", async () => {
+  it("uploads encrypted attachments through Signal's CDN2 resumable form flow", async () => {
     const fetch = vi.fn(async (_input: string | URL, init?: RequestInit): Promise<Response> => {
       if (init?.method === "POST") {
         return new Response(null, {
@@ -86,7 +86,10 @@ describe("Signal attachments", () => {
       getUploadForm: vi.fn(async () => ({
         cdn: 2,
         key: "cdn-key",
-        headers: new Map([["x-signal", "header"]]),
+        headers: new Map([
+          ["host", "cdn.example"],
+          ["x-signal", "header"],
+        ]),
         signedUploadUrl: new URL("https://upload.example/start"),
       })),
     };
@@ -107,7 +110,11 @@ describe("Signal attachments", () => {
       new URL("https://upload.example/start"),
       expect.objectContaining({
         method: "POST",
-        headers: { "x-signal": "header" },
+        headers: {
+          "Content-Length": "0",
+          "Content-Type": "application/octet-stream",
+          "x-signal": "header",
+        },
       }),
     );
     expect(fetch).toHaveBeenNthCalledWith(
@@ -115,12 +122,54 @@ describe("Signal attachments", () => {
       "https://upload.example/session",
       expect.objectContaining({
         method: "PUT",
-        headers: { "Content-Range": `bytes 0-*/${result.encrypted.byteLength}` },
+        headers: {
+          "Content-Range": `bytes 0-${result.encrypted.byteLength - 1}/${result.encrypted.byteLength}`,
+          "Content-Type": "application/octet-stream",
+        },
         body: result.encrypted,
       }),
     );
     expect(result.pointer.cdnKey).toBe("cdn-key");
     expect(result.pointer.cdnNumber).toBe(2);
+  });
+
+  it("uploads encrypted attachments through Signal's CDN3 creation-with-upload flow", async () => {
+    const fetch = vi.fn(async (): Promise<Response> => new Response(null, { status: 201 }));
+    const connection = {
+      getUploadForm: vi.fn(async () => ({
+        cdn: 3,
+        key: "cdn3-key",
+        headers: new Map([
+          ["host", "cdn3.example"],
+          ["x-signal", "header"],
+        ]),
+        signedUploadUrl: new URL("https://cdn3.example/upload"),
+      })),
+    };
+
+    const result = await uploadSignalAttachment({
+      connection,
+      attachment: { data: utf8Bytes("upload me"), contentType: "text/plain" },
+      fetch: fetch as FetchLike,
+      encryption: { keys: deterministicBytes(64, 12), iv: deterministicBytes(16, 13) },
+    });
+
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(fetch).toHaveBeenCalledWith(
+      new URL("https://cdn3.example/upload"),
+      expect.objectContaining({
+        method: "POST",
+        headers: {
+          "Content-Type": "application/offset+octet-stream",
+          "Tus-Resumable": "1.0.0",
+          "Upload-Length": String(result.encrypted.byteLength),
+          "x-signal": "header",
+        },
+        body: result.encrypted,
+      }),
+    );
+    expect(result.pointer.cdnKey).toBe("cdn3-key");
+    expect(result.pointer.cdnNumber).toBe(3);
   });
 
   it("downloads and decrypts attachments from the configured CDN", async () => {

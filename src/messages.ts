@@ -253,6 +253,17 @@ export function createTextSignalContent(params: {
   return { dataMessage };
 }
 
+export function createStickerSignalContent(params: {
+  sticker: SignalSticker;
+  timestamp?: number;
+  groupV2?: SignalGroupContextV2;
+}): SignalContent {
+  const dataMessage: SignalDataMessage = { sticker: params.sticker };
+  assignIfDefined(dataMessage, "timestamp", params.timestamp);
+  assignIfDefined(dataMessage, "groupV2", params.groupV2);
+  return { dataMessage };
+}
+
 export function createReactionSignalContent(reaction: SignalReaction): SignalContent {
   return { dataMessage: { reaction } };
 }

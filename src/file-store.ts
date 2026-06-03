@@ -1,5 +1,5 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import {
   IdentityChange,
   KyberPreKeyRecord,
@@ -64,12 +64,31 @@ export type FileSignalRecipientState = {
   updatedAt?: number;
 };
 
+export type FileSignalStickerState = {
+  id: number;
+  fileName: string;
+  emoji?: string;
+  contentType?: string;
+  size?: number;
+};
+
+export type FileSignalStickerPackState = {
+  id: string;
+  key: string;
+  installed?: boolean;
+  title?: string;
+  author?: string;
+  stickers: Record<string, FileSignalStickerState>;
+  updatedAt?: number;
+};
+
 export type FileSignalStoreData = {
   version: 1;
   repository: SerializedSignalRepository;
   account?: FileSignalAccountState;
   groups: Record<string, FileSignalGroupState>;
   recipients: Record<string, FileSignalRecipientState>;
+  stickerPacks: Record<string, FileSignalStickerPackState>;
   usedKyberPreKeys: string[];
 };
 
@@ -89,6 +108,7 @@ export class FileSignalRepository implements SignalRepository {
   private readonly senderKeys = new Map<string, SenderKeyRecord>();
   private readonly groups = new Map<string, FileSignalGroupState>();
   private readonly recipients = new Map<string, FileSignalRecipientState>();
+  private readonly stickerPacks = new Map<string, FileSignalStickerPackState>();
   private readonly usedKyberPreKeys = new Set<string>();
   private account: FileSignalAccountState | undefined;
   private pendingPersist: Promise<void> = Promise.resolve();
@@ -110,6 +130,10 @@ export class FileSignalRepository implements SignalRepository {
     }
     for (const [aci, recipient] of Object.entries(data.recipients)) {
       this.recipients.set(aci.toLowerCase(), { ...recipient, aci: recipient.aci.toLowerCase() });
+    }
+    for (const [id, pack] of Object.entries(data.stickerPacks)) {
+      const normalized = normalizeStickerPackId(pack.id || id);
+      this.stickerPacks.set(normalized, { ...pack, id: normalized });
     }
     for (const used of data.usedKyberPreKeys) {
       this.usedKyberPreKeys.add(used);
@@ -260,6 +284,28 @@ export class FileSignalRepository implements SignalRepository {
     await this.persist();
   }
 
+  async getStickerPack(id: string): Promise<FileSignalStickerPackState | undefined> {
+    return this.stickerPacks.get(normalizeStickerPackId(id));
+  }
+
+  async setStickerPack(pack: FileSignalStickerPackState): Promise<void> {
+    const id = normalizeStickerPackId(pack.id);
+    this.stickerPacks.set(id, {
+      ...pack,
+      id,
+      updatedAt: Date.now(),
+    });
+    await this.persist();
+  }
+
+  stickerStorePath(): string {
+    return `${this.filePath}.stickers`;
+  }
+
+  getStickerFilePath(packId: string, fileName: string): string {
+    return join(this.stickerStorePath(), normalizeStickerPackId(packId), normalizeStickerFileName(fileName));
+  }
+
   snapshot(): FileSignalStoreData {
     const account = this.account;
     return {
@@ -269,6 +315,9 @@ export class FileSignalRepository implements SignalRepository {
       groups: Object.fromEntries([...this.groups].sort(([a], [b]) => a.localeCompare(b))),
       recipients: Object.fromEntries(
         [...this.recipients].sort(([a], [b]) => a.localeCompare(b)),
+      ),
+      stickerPacks: Object.fromEntries(
+        [...this.stickerPacks].sort(([a], [b]) => a.localeCompare(b)),
       ),
       usedKyberPreKeys: [...this.usedKyberPreKeys].sort(),
     };
@@ -332,6 +381,7 @@ function createInitialStoreData(options: FileSignalRepositoryOptions): FileSigna
     ...(options.account ? { account: options.account } : {}),
     groups: {},
     recipients: {},
+    stickerPacks: {},
     usedKyberPreKeys: [],
   };
 }
@@ -354,8 +404,31 @@ function parseStoreFile(raw: string): FileSignalStoreData {
     ...(data.account ? { account: data.account } : {}),
     groups: data.groups,
     recipients: data.recipients ?? {},
+    stickerPacks: data.stickerPacks ?? {},
     usedKyberPreKeys: data.usedKyberPreKeys,
   };
+}
+
+function normalizeStickerPackId(id: string): string {
+  const normalized = id.trim().toLowerCase();
+  if (!/^(?:[0-9a-f]{2})+$/.test(normalized)) {
+    throw new SignalTsStateError("Signal sticker pack id must be even-length hex");
+  }
+  return normalized;
+}
+
+function normalizeStickerFileName(fileName: string): string {
+  const normalized = fileName.trim();
+  if (
+    !normalized ||
+    normalized === "." ||
+    normalized === ".." ||
+    normalized.includes("/") ||
+    normalized.includes("\\")
+  ) {
+    throw new SignalTsStateError("Signal sticker file name must be a relative file name");
+  }
+  return normalized;
 }
 
 function serializeMap<T>(

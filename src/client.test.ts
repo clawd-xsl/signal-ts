@@ -1,9 +1,99 @@
 import { Aci } from "@signalapp/libsignal-client";
 import type { SingleOutboundUnsealedMessage } from "@signalapp/libsignal-client/dist/net/chat/SingleOutboundMessage.js";
 import { describe, expect, it, vi } from "vitest";
-import { SignalTsClient, type SignalChatConnection } from "./client.js";
+import {
+  SignalTsClient,
+  type SendContentMessageParams,
+  type UploadAttachmentParams,
+  type SignalChatConnection,
+} from "./client.js";
+import type { SignalAttachmentPointer, SignalContent } from "./messages.js";
+
+const UTF8_DECODER = new TextDecoder();
+const LONG_TEXT_CONTENT_TYPE = "text/x-signal-plain";
+
+function createTestClient(): SignalTsClient {
+  return new SignalTsClient({
+    account: {
+      auth: { username: "user.1", password: "pass" },
+      device: {
+        aci: "11111111-1111-4111-8111-111111111111",
+        deviceId: 1,
+        registrationId: 42,
+      },
+    },
+    connectionFactory: async () => {
+      throw new Error("test connection factory should not be called");
+    },
+  });
+}
+
+function createContentParams(traceId: string, timestamp: number): SendContentMessageParams {
+  return {
+    traceId,
+    destination: Aci.fromUuid("22222222-2222-4222-8222-222222222222"),
+    timestamp,
+    content: { nullMessage: { padding: new Uint8Array() } },
+    stores: {} as SendContentMessageParams["stores"],
+  };
+}
+
+function createAttachmentPointer(overrides: Partial<SignalAttachmentPointer> = {}) {
+  return {
+    cdnKey: "cdn-key",
+    cdnNumber: 2,
+    contentType: "image/png",
+    key: new Uint8Array(64),
+    digest: new Uint8Array(32),
+    size: 3,
+    ...overrides,
+  } satisfies SignalAttachmentPointer;
+}
 
 describe("SignalTsClient", () => {
+  it("serializes content sends that mutate Signal session state", async () => {
+    const client = createTestClient();
+    const events: string[] = [];
+    let resolveFirstStarted!: () => void;
+    let releaseFirst!: () => void;
+    const firstStarted = new Promise<void>((resolve) => {
+      resolveFirstStarted = resolve;
+    });
+    const firstCanFinish = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const sendContentMessageUnlocked = vi.fn(
+      async (params: SendContentMessageParams): Promise<{ timestamp: number }> => {
+        events.push(`${params.traceId}:start`);
+        if (params.traceId === "first") {
+          resolveFirstStarted();
+          await firstCanFinish;
+        }
+        events.push(`${params.traceId}:end`);
+        return { timestamp: params.timestamp ?? 0 };
+      },
+    );
+    (
+      client as unknown as {
+        sendContentMessageUnlocked: typeof sendContentMessageUnlocked;
+      }
+    ).sendContentMessageUnlocked = sendContentMessageUnlocked;
+
+    const first = client.sendContentMessage(createContentParams("first", 1));
+    await firstStarted;
+    const second = client.sendContentMessage(createContentParams("second", 2));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(events).toEqual(["first:start"]);
+
+    releaseFirst();
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      { timestamp: 1 },
+      { timestamp: 2 },
+    ]);
+    expect(events).toEqual(["first:start", "first:end", "second:start", "second:end"]);
+  });
+
   it("connects through the injected connection factory and sends encrypted payloads", async () => {
     const sendMessage = vi.fn(async () => {});
     const sendSyncMessage = vi.fn(async () => {});
@@ -130,5 +220,100 @@ describe("SignalTsClient", () => {
     });
 
     expect(observedThis).toBe(connection);
+  });
+
+  it("sends oversized direct text as a Signal long-text attachment", async () => {
+    const client = createTestClient();
+    const body = `${"a".repeat(1999)}é-tail`;
+    const existingAttachment = createAttachmentPointer({ cdnKey: "image-cdn-key" });
+    let sentContent: SignalContent | undefined;
+    const uploadAttachment = vi.fn(async (params: UploadAttachmentParams) => {
+      expect(params.attachment.contentType).toBe(LONG_TEXT_CONTENT_TYPE);
+      expect(params.attachment.uploadTimestamp).toBe(123);
+      expect(UTF8_DECODER.decode(params.attachment.data)).toBe(body);
+      return {
+        encrypted: new Uint8Array(),
+        pointer: createAttachmentPointer({
+          cdnKey: "long-text-cdn-key",
+          contentType: LONG_TEXT_CONTENT_TYPE,
+          size: params.attachment.data.byteLength,
+        }),
+        plaintextHash: "hash",
+      };
+    });
+    const sendContentMessage = vi.fn(async (params: SendContentMessageParams) => {
+      sentContent = params.content;
+      return { timestamp: params.timestamp ?? 0 };
+    });
+    Object.assign(client, { uploadAttachment, sendContentMessage });
+
+    await client.sendMessage({
+      traceId: "long-direct",
+      destination: Aci.fromUuid("22222222-2222-4222-8222-222222222222"),
+      body,
+      attachments: [existingAttachment],
+      timestamp: 123,
+      stores: {} as SendContentMessageParams["stores"],
+    });
+
+    expect(uploadAttachment).toHaveBeenCalledTimes(1);
+    expect(sendContentMessage).toHaveBeenCalledTimes(1);
+    expect(sentContent?.dataMessage?.body).toBe("a".repeat(1999));
+    expect(sentContent?.dataMessage?.attachments).toEqual([
+      expect.objectContaining({
+        cdnKey: "long-text-cdn-key",
+        contentType: LONG_TEXT_CONTENT_TYPE,
+      }),
+      existingAttachment,
+    ]);
+  });
+
+  it("sends oversized group text as a Signal long-text attachment", async () => {
+    const client = createTestClient();
+    const body = "测".repeat(700);
+    let sentContent: SignalContent | undefined;
+    const uploadAttachment = vi.fn(async (params: UploadAttachmentParams) => ({
+      encrypted: new Uint8Array(),
+      pointer: createAttachmentPointer({
+        cdnKey: "group-long-text-cdn-key",
+        contentType: LONG_TEXT_CONTENT_TYPE,
+        size: params.attachment.data.byteLength,
+      }),
+      plaintextHash: "hash",
+    }));
+    const sendGroupContentMessage = vi.fn(async (params: { content: SignalContent }) => {
+      sentContent = params.content;
+      return { timestamp: 456, recipients: 1 };
+    });
+    Object.assign(client, { uploadAttachment, sendGroupContentMessage });
+
+    await client.sendGroupMessage({
+      traceId: "long-group",
+      members: [],
+      group: {
+        masterKey: new Uint8Array(32),
+        revision: 7,
+        distributionId: "33333333-3333-4333-8333-333333333333",
+      },
+      body,
+      timestamp: 456,
+      stores: {} as Parameters<SignalTsClient["sendGroupMessage"]>[0]["stores"],
+    });
+
+    expect(uploadAttachment).toHaveBeenCalledTimes(1);
+    expect(uploadAttachment.mock.calls[0]?.[0].attachment.contentType).toBe(
+      LONG_TEXT_CONTENT_TYPE,
+    );
+    expect(sentContent?.dataMessage?.body).toBe("测".repeat(666));
+    expect(sentContent?.dataMessage?.attachments?.[0]).toEqual(
+      expect.objectContaining({
+        cdnKey: "group-long-text-cdn-key",
+        contentType: LONG_TEXT_CONTENT_TYPE,
+      }),
+    );
+    expect(sentContent?.dataMessage?.groupV2).toEqual({
+      masterKey: new Uint8Array(32),
+      revision: 7,
+    });
   });
 });

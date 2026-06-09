@@ -27,7 +27,7 @@ import {
   type EncryptedSignalAttachment,
   type SignalAttachmentInput,
 } from "./attachments.js";
-import { bytesToHex } from "./bytes.js";
+import { bytesToHex, utf8Bytes } from "./bytes.js";
 import {
   createSignalDecryptionErrorPlaintextContent,
   encryptPayloadForDevice,
@@ -281,6 +281,8 @@ export type UploadAttachmentParams = {
 };
 
 const DEFAULT_USER_AGENT = "OpenClaw signal-ts/0.0.0";
+const SIGNAL_LONG_TEXT_CONTENT_TYPE = "text/x-signal-plain";
+const SIGNAL_MESSAGE_BODY_MAX_BYTES = 2000;
 
 let signalTraceSequence = 0;
 
@@ -430,6 +432,30 @@ function describeAttachmentInput(attachment: SignalAttachmentInput): string {
   ].join(" ");
 }
 
+function encodeUtf8(text: string): ReturnType<typeof utf8Bytes> {
+  return utf8Bytes(text);
+}
+
+function splitUtf8TextAtByteLimit(text: string, limit: number): {
+  prefix: string;
+  prefixBytes: number;
+} {
+  let byteLength = 0;
+  let endIndex = 0;
+  for (const segment of text) {
+    const segmentBytes = encodeUtf8(segment).byteLength;
+    if (byteLength + segmentBytes > limit) {
+      break;
+    }
+    byteLength += segmentBytes;
+    endIndex += segment.length;
+  }
+  return {
+    prefix: text.slice(0, endIndex),
+    prefixBytes: byteLength,
+  };
+}
+
 function describeIncomingEnvelope(envelope: Uint8Array, serverDeliveredTimestamp: number): string {
   const parts = [
     `len=${envelope.byteLength}`,
@@ -463,6 +489,7 @@ export class SignalTsClient {
   private readonly logger: SignalLogger | undefined;
   private readonly connectionFactory: SignalConnectionFactory | undefined;
   private readonly sealedSenderConnectionFactory: SignalSealedSenderConnectionFactory | undefined;
+  private signalStateMutationQueue: Promise<void> = Promise.resolve();
   private net: Net.Net | undefined;
   private connection: SignalChatConnection | undefined;
 
@@ -494,6 +521,30 @@ export class SignalTsClient {
       return;
     }
     this.logger?.warn?.(err === undefined ? message : `${message}: ${describeSignalError(err)}`);
+  }
+
+  private async runSerializedSignalStateMutation<T>(
+    traceId: string,
+    operation: string,
+    run: () => Promise<T>,
+  ): Promise<T> {
+    const previous = this.signalStateMutationQueue;
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.signalStateMutationQueue = previous.then(() => current, () => current);
+    const waitStartedAt = Date.now();
+    await previous.catch(() => undefined);
+    const waitMs = Date.now() - waitStartedAt;
+    if (waitMs > 0) {
+      this.logDebug(`${traceId} ${operation} state-lock acquired waitMs=${waitMs}`);
+    }
+    try {
+      return await run();
+    } finally {
+      release();
+    }
   }
 
   on<K extends SignalEventName>(event: K, handler: SignalEventHandler<K>): () => void {
@@ -599,19 +650,46 @@ export class SignalTsClient {
     return await this.sendMessage(params);
   }
 
-  async sendMessage(params: SendMessageParams): Promise<{ timestamp: number }> {
-    const traceId = params.traceId ?? createSignalTraceId("message");
-    if (!params.body && (!params.attachments || params.attachments.length === 0)) {
-      this.logWarn(`${traceId} message-send rejected: missing body and attachments`);
-      throw new SignalTsStateError("Signal message requires body or attachments");
+  private async createTextContent(params: {
+    body: string;
+    timestamp: number;
+    traceId: string;
+    attachments?: SignalAttachmentPointer[];
+    quote?: SignalQuote;
+    bodyRanges?: SignalBodyRange[];
+    groupV2?: SignalGroupContextV2;
+    abortSignal?: AbortSignal;
+  }): Promise<SignalContent> {
+    let body = params.body;
+    const attachments = params.attachments ? [...params.attachments] : [];
+    const bodyBytes = encodeUtf8(body);
+    if (bodyBytes.byteLength > SIGNAL_MESSAGE_BODY_MAX_BYTES) {
+      const trimmed = splitUtf8TextAtByteLimit(body, SIGNAL_MESSAGE_BODY_MAX_BYTES);
+      this.logDebug(
+        `${params.traceId} long-text upload start bodyBytes=${bodyBytes.byteLength} prefixBytes=${trimmed.prefixBytes} existingAttachments=${attachments.length}`,
+      );
+      const uploaded = await this.uploadAttachment({
+        traceId: `${params.traceId}:long-text`,
+        attachment: {
+          data: bodyBytes,
+          contentType: SIGNAL_LONG_TEXT_CONTENT_TYPE,
+          uploadTimestamp: params.timestamp,
+        },
+        ...(params.abortSignal ? { abortSignal: params.abortSignal } : {}),
+      });
+      attachments.unshift(uploaded.pointer);
+      body = trimmed.prefix;
+      this.logDebug(
+        `${params.traceId} long-text upload done bodyBytes=${bodyBytes.byteLength} prefixChars=${body.length} attachments=${attachments.length}`,
+      );
     }
-    const timestamp = params.timestamp ?? Date.now();
+
     const contentParams: Parameters<typeof createTextSignalContent>[0] = {
-      body: params.body ?? "",
-      timestamp,
+      body,
+      timestamp: params.timestamp,
     };
-    if (params.attachments !== undefined) {
-      contentParams.attachments = params.attachments;
+    if (attachments.length > 0) {
+      contentParams.attachments = attachments;
     }
     if (params.quote !== undefined) {
       contentParams.quote = params.quote;
@@ -622,11 +700,31 @@ export class SignalTsClient {
     if (params.groupV2 !== undefined) {
       contentParams.groupV2 = params.groupV2;
     }
+    return createTextSignalContent(contentParams);
+  }
+
+  async sendMessage(params: SendMessageParams): Promise<{ timestamp: number }> {
+    const traceId = params.traceId ?? createSignalTraceId("message");
+    if (!params.body && (!params.attachments || params.attachments.length === 0)) {
+      this.logWarn(`${traceId} message-send rejected: missing body and attachments`);
+      throw new SignalTsStateError("Signal message requires body or attachments");
+    }
+    const timestamp = params.timestamp ?? Date.now();
+    const content = await this.createTextContent({
+      body: params.body ?? "",
+      timestamp,
+      traceId,
+      ...(params.attachments !== undefined ? { attachments: params.attachments } : {}),
+      ...(params.quote !== undefined ? { quote: params.quote } : {}),
+      ...(params.bodyRanges !== undefined ? { bodyRanges: params.bodyRanges } : {}),
+      ...(params.groupV2 !== undefined ? { groupV2: params.groupV2 } : {}),
+      ...(params.abortSignal ? { abortSignal: params.abortSignal } : {}),
+    });
     return await this.sendContentMessage({
       ...params,
       traceId,
       timestamp,
-      content: createTextSignalContent(contentParams),
+      content,
     });
   }
 
@@ -684,6 +782,15 @@ export class SignalTsClient {
 
   async sendContentMessage(params: SendContentMessageParams): Promise<{ timestamp: number }> {
     const traceId = params.traceId ?? createSignalTraceId("content");
+    return await this.runSerializedSignalStateMutation(traceId, "content-send", async () =>
+      await this.sendContentMessageUnlocked({ ...params, traceId }),
+    );
+  }
+
+  private async sendContentMessageUnlocked(
+    params: SendContentMessageParams,
+  ): Promise<{ timestamp: number }> {
+    const traceId = params.traceId ?? createSignalTraceId("content");
     const timestamp = params.timestamp ?? Date.now();
     this.logDebug(
       [
@@ -730,33 +837,32 @@ export class SignalTsClient {
       );
       const payload = encodeSignalContent(params.content);
       this.logDebug(`${traceId} content-send payload encoded bytes=${payload.byteLength}`);
-      const contents = await Promise.all(
-        preKeyBundles.map(async (bundle) => {
-          const remoteAddress = ProtocolAddress.new(destination, bundle.deviceId());
-          const existingSession = await params.stores.sessionStore.getSession(remoteAddress);
-          this.logDebug(
-            `${traceId} content-send encrypt device=${bundle.deviceId()} registration=${bundle.registrationId()} existingSession=${existingSession ? "yes" : "no"}`,
-          );
-          const device = {
-            serviceId: destination,
-            deviceId: bundle.deviceId(),
-            registrationId: bundle.registrationId(),
-          };
-          if (!existingSession) {
-            Object.assign(device, { preKeyBundle: bundle });
-          }
-          const encrypted = await encryptPayloadForDevice({
-            localAddress,
-            device,
-            payload,
-            stores: params.stores,
-          });
-          this.logDebug(
-            `${traceId} content-send encrypted device=${encrypted.deviceId} registration=${encrypted.registrationId} ciphertextType=${encrypted.contents.type()}`,
-          );
-          return encrypted;
-        }),
-      );
+      const contents: Array<SendMessageRequest["contents"][number]> = [];
+      for (const bundle of preKeyBundles) {
+        const remoteAddress = ProtocolAddress.new(destination, bundle.deviceId());
+        const existingSession = await params.stores.sessionStore.getSession(remoteAddress);
+        this.logDebug(
+          `${traceId} content-send encrypt device=${bundle.deviceId()} registration=${bundle.registrationId()} existingSession=${existingSession ? "yes" : "no"}`,
+        );
+        const device = {
+          serviceId: destination,
+          deviceId: bundle.deviceId(),
+          registrationId: bundle.registrationId(),
+        };
+        if (!existingSession) {
+          Object.assign(device, { preKeyBundle: bundle });
+        }
+        const encrypted = await encryptPayloadForDevice({
+          localAddress,
+          device,
+          payload,
+          stores: params.stores,
+        });
+        this.logDebug(
+          `${traceId} content-send encrypted device=${encrypted.deviceId} registration=${encrypted.registrationId} ciphertextType=${encrypted.contents.type()}`,
+        );
+        contents.push(encrypted);
+      }
       const sendParams: SendEncryptedMessageParams = {
         traceId,
         destination,
@@ -790,6 +896,7 @@ export class SignalTsClient {
     params: SendRetryReceiptMessageParams,
   ): Promise<{ timestamp: number }> {
     const traceId = params.traceId ?? createSignalTraceId("retry-receipt");
+    return await this.runSerializedSignalStateMutation(traceId, "retry-receipt", async () => {
     const timestamp = params.timestamp ?? Date.now();
     this.logDebug(
       [
@@ -844,12 +951,14 @@ export class SignalTsClient {
       );
       throw err;
     }
+    });
   }
 
   async sendSealedContentMessage(
     params: SendSealedContentMessageParams,
   ): Promise<{ timestamp: number }> {
     const traceId = params.traceId ?? createSignalTraceId("sealed");
+    return await this.runSerializedSignalStateMutation(traceId, "sealed-send", async () => {
     const timestamp = params.timestamp ?? Date.now();
     this.logDebug(
       [
@@ -890,42 +999,41 @@ export class SignalTsClient {
       }
       const localAddress = this.localAddress();
       const payload = encodeSignalContent(params.content);
-      const contents = await Promise.all(
-        preKeyBundles.map(async (bundle) => {
-          const remoteAddress = ProtocolAddress.new(destination, bundle.deviceId());
-          const existingSession = await params.stores.sessionStore.getSession(remoteAddress);
-          this.logDebug(
-            `${traceId} sealed-send encrypt device=${bundle.deviceId()} registration=${bundle.registrationId()} existingSession=${existingSession ? "yes" : "no"}`,
-          );
-          if (!existingSession) {
-            await processPreKeyBundle(
-              bundle,
-              remoteAddress,
-              localAddress,
-              params.stores.sessionStore,
-              params.stores.identityStore,
-            );
-            this.logDebug(
-              `${traceId} sealed-send processed prekey bundle device=${bundle.deviceId()} registration=${bundle.registrationId()}`,
-            );
-          }
-          const encrypted = await sealedSenderEncryptMessage(
-            padSignalMessageBody(payload),
+      const contents: Array<SendSealedMessageRequest["contents"][number]> = [];
+      for (const bundle of preKeyBundles) {
+        const remoteAddress = ProtocolAddress.new(destination, bundle.deviceId());
+        const existingSession = await params.stores.sessionStore.getSession(remoteAddress);
+        this.logDebug(
+          `${traceId} sealed-send encrypt device=${bundle.deviceId()} registration=${bundle.registrationId()} existingSession=${existingSession ? "yes" : "no"}`,
+        );
+        if (!existingSession) {
+          await processPreKeyBundle(
+            bundle,
             remoteAddress,
-            params.senderCertificate,
+            localAddress,
             params.stores.sessionStore,
             params.stores.identityStore,
           );
           this.logDebug(
-            `${traceId} sealed-send encrypted device=${bundle.deviceId()} registration=${bundle.registrationId()} bytes=${encrypted.byteLength}`,
+            `${traceId} sealed-send processed prekey bundle device=${bundle.deviceId()} registration=${bundle.registrationId()}`,
           );
-          return {
-            deviceId: bundle.deviceId(),
-            registrationId: bundle.registrationId(),
-            contents: encrypted,
-          };
-        }),
-      );
+        }
+        const encrypted = await sealedSenderEncryptMessage(
+          padSignalMessageBody(payload),
+          remoteAddress,
+          params.senderCertificate,
+          params.stores.sessionStore,
+          params.stores.identityStore,
+        );
+        this.logDebug(
+          `${traceId} sealed-send encrypted device=${bundle.deviceId()} registration=${bundle.registrationId()} bytes=${encrypted.byteLength}`,
+        );
+        contents.push({
+          deviceId: bundle.deviceId(),
+          registrationId: bundle.registrationId(),
+          contents: encrypted,
+        });
+      }
       this.logDebug(
         `${traceId} sealed-send connection start destination=${describeServiceId(destination)}`,
       );
@@ -961,6 +1069,7 @@ export class SignalTsClient {
       );
       throw err;
     }
+    });
   }
 
   async sendSyncMessage(params: SendSyncMessageParams): Promise<{ timestamp: number }> {
@@ -1005,6 +1114,7 @@ export class SignalTsClient {
     params: SendSyncContentMessageParams,
   ): Promise<{ timestamp: number }> {
     const traceId = params.traceId ?? createSignalTraceId("sync-content");
+    return await this.runSerializedSignalStateMutation(traceId, "sync-content", async () => {
     if (params.preKeyBundles.length === 0) {
       this.logWarn(`${traceId} sync-content rejected: no linked-device prekey bundles`);
       throw new SignalTsStateError("Signal sync message requires linked-device prekey bundles");
@@ -1018,33 +1128,32 @@ export class SignalTsClient {
       const destination = Aci.fromUuid(this.options.account.device.aci);
       const payload = encodeSignalContent(params.content);
       this.logDebug(`${traceId} sync-content payload encoded bytes=${payload.byteLength}`);
-      const contents = await Promise.all(
-        params.preKeyBundles.map(async (bundle) => {
-          const remoteAddress = ProtocolAddress.new(destination, bundle.deviceId());
-          const existingSession = await params.stores.sessionStore.getSession(remoteAddress);
-          this.logDebug(
-            `${traceId} sync-content encrypt device=${bundle.deviceId()} registration=${bundle.registrationId()} existingSession=${existingSession ? "yes" : "no"}`,
-          );
-          const device = {
-            serviceId: destination,
-            deviceId: bundle.deviceId(),
-            registrationId: bundle.registrationId(),
-          };
-          if (!existingSession) {
-            Object.assign(device, { preKeyBundle: bundle });
-          }
-          const encrypted = await encryptPayloadForDevice({
-            localAddress,
-            device,
-            payload,
-            stores: params.stores,
-          });
-          this.logDebug(
-            `${traceId} sync-content encrypted device=${encrypted.deviceId} registration=${encrypted.registrationId} ciphertextType=${encrypted.contents.type()}`,
-          );
-          return encrypted;
-        }),
-      );
+      const contents: Array<SendSyncMessageRequest["contents"][number]> = [];
+      for (const bundle of params.preKeyBundles) {
+        const remoteAddress = ProtocolAddress.new(destination, bundle.deviceId());
+        const existingSession = await params.stores.sessionStore.getSession(remoteAddress);
+        this.logDebug(
+          `${traceId} sync-content encrypt device=${bundle.deviceId()} registration=${bundle.registrationId()} existingSession=${existingSession ? "yes" : "no"}`,
+        );
+        const device = {
+          serviceId: destination,
+          deviceId: bundle.deviceId(),
+          registrationId: bundle.registrationId(),
+        };
+        if (!existingSession) {
+          Object.assign(device, { preKeyBundle: bundle });
+        }
+        const encrypted = await encryptPayloadForDevice({
+          localAddress,
+          device,
+          payload,
+          stores: params.stores,
+        });
+        this.logDebug(
+          `${traceId} sync-content encrypted device=${encrypted.deviceId} registration=${encrypted.registrationId} ciphertextType=${encrypted.contents.type()}`,
+        );
+        contents.push(encrypted);
+      }
       const result = await this.sendSyncMessage({
         traceId,
         timestamp,
@@ -1063,6 +1172,7 @@ export class SignalTsClient {
       );
       throw err;
     }
+    });
   }
 
   async sendGroupMessage(params: SendGroupMessageParams): Promise<{
@@ -1075,28 +1185,24 @@ export class SignalTsClient {
       throw new SignalTsStateError("Signal group message requires body or attachments");
     }
     const timestamp = params.timestamp ?? Date.now();
-    const contentParams: Parameters<typeof createTextSignalContent>[0] = {
+    const content = await this.createTextContent({
       body: params.body ?? "",
       timestamp,
+      traceId,
       groupV2: {
         masterKey: params.group.masterKey,
         ...(params.group.revision !== undefined ? { revision: params.group.revision } : {}),
       },
-    };
-    if (params.attachments !== undefined) {
-      contentParams.attachments = params.attachments;
-    }
-    if (params.quote !== undefined) {
-      contentParams.quote = params.quote;
-    }
-    if (params.bodyRanges !== undefined) {
-      contentParams.bodyRanges = params.bodyRanges;
-    }
+      ...(params.attachments !== undefined ? { attachments: params.attachments } : {}),
+      ...(params.quote !== undefined ? { quote: params.quote } : {}),
+      ...(params.bodyRanges !== undefined ? { bodyRanges: params.bodyRanges } : {}),
+      ...(params.abortSignal ? { abortSignal: params.abortSignal } : {}),
+    });
     return await this.sendGroupContentMessage({
       ...params,
       traceId,
       timestamp,
-      content: createTextSignalContent(contentParams),
+      content,
     });
   }
 
@@ -1146,6 +1252,16 @@ export class SignalTsClient {
     recipients: number;
   }> {
     const traceId = params.traceId ?? createSignalTraceId("group-content");
+    return await this.runSerializedSignalStateMutation(traceId, "group-content", async () =>
+      await this.sendGroupContentMessageUnlocked({ ...params, traceId }),
+    );
+  }
+
+  private async sendGroupContentMessageUnlocked(params: SendGroupContentMessageParams): Promise<{
+    timestamp: number;
+    recipients: number;
+  }> {
+    const traceId = params.traceId ?? createSignalTraceId("group-content");
     const timestamp = params.timestamp ?? Date.now();
     this.logDebug(
       [
@@ -1182,36 +1298,35 @@ export class SignalTsClient {
       this.logDebug(
         `${traceId} group-content sender-key-distribution created bytes=${senderKeyDistributionBytes.byteLength}`,
       );
-      const memberBundles = await Promise.all(
-        recipients.map(async (destination) => {
-          const providedBundles = params.memberPreKeyBundles?.get(destination.getServiceIdString());
-          this.logDebug(
-            `${traceId} group-content member prekeys start destination=${describeServiceId(destination)} source=${providedBundles ? "provided" : "fetch"} auth=${params.preKeyAuth ? "yes" : "no"}`,
-          );
-          const bundles =
-            providedBundles ??
-            (await this.fetchPreKeyBundlesForGroupMember({
-              destination,
-              preKeyAuth: params.preKeyAuth,
-              abortSignal: params.abortSignal,
-            }));
-          this.logDebug(
-            `${traceId} group-content member prekeys done destination=${describeServiceId(destination)} count=${bundles.length} devices=${describePreKeyBundleDevices(bundles)}`,
-          );
-          await this.sendContentMessage({
-            traceId: `${traceId}:sender-key:${describeServiceId(destination)}`,
+      const memberBundles: Array<{ destination: ServiceId; bundles: PreKeyBundle[] }> = [];
+      for (const destination of recipients) {
+        const providedBundles = params.memberPreKeyBundles?.get(destination.getServiceIdString());
+        this.logDebug(
+          `${traceId} group-content member prekeys start destination=${describeServiceId(destination)} source=${providedBundles ? "provided" : "fetch"} auth=${params.preKeyAuth ? "yes" : "no"}`,
+        );
+        const bundles =
+          providedBundles ??
+          (await this.fetchPreKeyBundlesForGroupMember({
             destination,
-            content: { senderKeyDistributionMessage: senderKeyDistributionBytes },
-            stores: params.stores,
-            preKeyBundles: bundles,
-            timestamp,
-            ...(params.onlineOnly !== undefined ? { onlineOnly: params.onlineOnly } : {}),
-            ...(params.urgent !== undefined ? { urgent: params.urgent } : {}),
-            ...(params.abortSignal ? { abortSignal: params.abortSignal } : {}),
-          });
-          return { destination, bundles };
-        }),
-      );
+            preKeyAuth: params.preKeyAuth,
+            abortSignal: params.abortSignal,
+          }));
+        this.logDebug(
+          `${traceId} group-content member prekeys done destination=${describeServiceId(destination)} count=${bundles.length} devices=${describePreKeyBundleDevices(bundles)}`,
+        );
+        await this.sendContentMessageUnlocked({
+          traceId: `${traceId}:sender-key:${describeServiceId(destination)}`,
+          destination,
+          content: { senderKeyDistributionMessage: senderKeyDistributionBytes },
+          stores: params.stores,
+          preKeyBundles: bundles,
+          timestamp,
+          ...(params.onlineOnly !== undefined ? { onlineOnly: params.onlineOnly } : {}),
+          ...(params.urgent !== undefined ? { urgent: params.urgent } : {}),
+          ...(params.abortSignal ? { abortSignal: params.abortSignal } : {}),
+        });
+        memberBundles.push({ destination, bundles });
+      }
       const groupPayload = encodeSignalContent(params.content);
       this.logDebug(`${traceId} group-content payload encoded bytes=${groupPayload.byteLength}`);
       const groupCiphertext = await groupEncrypt(

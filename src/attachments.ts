@@ -17,6 +17,7 @@ import {
 import { copyBytes, type Bytes } from "./bytes.js";
 import { SignalTsStateError } from "./errors.js";
 import type { SignalAttachmentPointer } from "./messages.js";
+import { signalAttachmentFetch, type SignalFetch } from "./signal-cdn-fetch.js";
 
 const ATTACHMENT_KEY_LENGTH = 64;
 const AES_KEY_LENGTH = 32;
@@ -63,7 +64,7 @@ export type AttachmentUploadConnection = {
   ) => Promise<UploadForm>;
 };
 
-export type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
+export type FetchLike = SignalFetch;
 
 export type UploadSignalAttachmentParams = {
   connection: AttachmentUploadConnection;
@@ -146,7 +147,7 @@ export function decryptSignalAttachment(pointer: SignalAttachmentPointer, encryp
 export async function uploadSignalAttachment({
   connection,
   attachment,
-  fetch: fetchImpl = globalThis.fetch,
+  fetch: fetchImpl = signalAttachmentFetch,
   abortSignal,
   encryption,
 }: UploadSignalAttachmentParams): Promise<EncryptedSignalAttachment> {
@@ -172,7 +173,7 @@ export async function uploadSignalAttachment({
 
 export async function downloadSignalAttachment({
   pointer,
-  fetch: fetchImpl = globalThis.fetch,
+  fetch: fetchImpl = signalAttachmentFetch,
   cdnUrls = DEFAULT_CDN_URLS,
   abortSignal,
 }: DownloadSignalAttachmentParams): Promise<Bytes> {

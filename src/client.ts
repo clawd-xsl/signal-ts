@@ -25,6 +25,7 @@ import {
   uploadSignalAttachment,
   type AttachmentUploadConnection,
   type EncryptedSignalAttachment,
+  type FetchLike,
   type SignalAttachmentInput,
 } from "./attachments.js";
 import { bytesToHex, utf8Bytes } from "./bytes.js";
@@ -56,6 +57,7 @@ import {
   type SignalTypingMessage,
 } from "./messages.js";
 import { fetchRecipientPreKeys, type FetchPreKeysParams, type PreKeyAuth } from "./prekeys.js";
+import { signalAttachmentFetch } from "./signal-cdn-fetch.js";
 import type { LibsignalStores } from "./store.js";
 import {
   resolveSignalRecipientTarget,
@@ -276,7 +278,7 @@ type SendGroupContentMessageParams = SignalGroupMessageTarget & {
 export type UploadAttachmentParams = {
   traceId?: string;
   attachment: SignalAttachmentInput;
-  fetch?: typeof globalThis.fetch;
+  fetch?: FetchLike;
   abortSignal?: AbortSignal;
 };
 
@@ -1400,10 +1402,9 @@ export class SignalTsClient {
         throw err;
       }
     };
-    const fetchImpl = params.fetch ?? globalThis.fetch;
-    const loggingFetch: typeof globalThis.fetch = async (input, init) => {
-      const url =
-        input instanceof URL ? input.toString() : typeof input === "string" ? input : input.url;
+    const fetchImpl = params.fetch ?? signalAttachmentFetch;
+    const loggingFetch: FetchLike = async (input, init) => {
+      const url = input instanceof URL ? input.toString() : input;
       this.logDebug(
         `${traceId} attachment-upload fetch start method=${init?.method ?? "GET"} url=${url}`,
       );

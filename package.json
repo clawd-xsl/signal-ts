@@ -20,7 +20,8 @@
   },
   "dependencies": {
     "@signalapp/libsignal-client": "^0.94.3",
-    "protobufjs": "^8.5.0"
+    "protobufjs": "^8.5.0",
+    "undici": "8.0.2"
   },
   "devDependencies": {
     "@types/node": "^24.12.0",

@@ -14,6 +14,7 @@ export * from "./messages.js";
 export * from "./prekeys.js";
 export * from "./profile.js";
 export * from "./provisioning.js";
+export * from "./signal-cdn-fetch.js";
 export * from "./store.js";
 export * from "./targets.js";
 export * from "./trust-roots.js";

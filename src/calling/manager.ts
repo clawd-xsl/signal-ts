@@ -5,7 +5,7 @@
 // so tsc never resolves the specifier and the build is identical whether or not the
 // optionalDependency is installed.
 import { Aci, ProtocolAddress } from "@signalapp/libsignal-client";
-import type { SignalAccountState, SignalEnvironment } from "../account.js";
+import type { SignalAccountState } from "../account.js";
 import type { Bytes } from "../bytes.js";
 import type { SignalLogger, SignalTsClient } from "../client.js";
 import { SignalTsCallingUnavailableError, SignalTsStateError } from "../errors.js";
@@ -676,8 +676,6 @@ export function createSignalCallManager(params: {
       "hideIp" | "dataMode" | "outgoingRingTimeoutMs" | "maxCallDurationMs" | "fieldTrials" | "pulse"
     >
   >;
-  environment?: SignalEnvironment;
-  userAgent?: string;
   logger?: SignalLogger;
 }): SignalCallManager {
   const { client, account, stores } = params;
@@ -707,12 +705,10 @@ export function createSignalCallManager(params: {
     config,
     send,
     identity,
+    // Reuse the monitor's single authenticated connection for the TURN fetch; a
+    // second authenticated connect would ConnectedElsewhere the monitor mid-call.
     fetchTurnServers: () =>
-      fetchTurnServers({
-        account,
-        ...(params.environment !== undefined ? { environment: params.environment } : {}),
-        ...(params.userAgent !== undefined ? { userAgent: params.userAgent } : {}),
-      }),
+      fetchTurnServers({ fetch: (request, options) => client.fetchAuthenticated(request, options) }),
     ...(params.logger !== undefined ? { logger: params.logger } : {}),
   });
 }

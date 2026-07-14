@@ -79,6 +79,9 @@ export type SignalChatConnection = Pick<
   Net.AuthenticatedChatConnection,
   "disconnect" | "connectionInfo"
 > & {
+  // Authenticated REST over the live connection. Optional so lightweight test
+  // doubles need not implement it; the real libsignal connection always has it.
+  fetch?: Net.AuthenticatedChatConnection["fetch"];
   getUploadForm?: AttachmentUploadConnection["getUploadForm"];
   sendMessage: (
     request: SendMessageRequest,
@@ -870,6 +873,23 @@ export class SignalTsClient {
         throw err;
       }
     }
+  }
+
+  /**
+   * Issue an authenticated REST request over the EXISTING chat connection. Signal
+   * permits only one authenticated socket per device, so callers (e.g. calling
+   * TURN fetch) must reuse this rather than opening a second connection — a
+   * second authenticated connect triggers a server-side ConnectedElsewhere that
+   * disconnects the monitor.
+   */
+  async fetchAuthenticated(
+    ...args: Parameters<NonNullable<SignalChatConnection["fetch"]>>
+  ): ReturnType<NonNullable<SignalChatConnection["fetch"]>> {
+    const connection = this.connection;
+    if (!connection?.fetch) {
+      throw new SignalTsStateError("SignalTsClient is not connected");
+    }
+    return await connection.fetch(...args);
   }
 
   async sendEncryptedMessage(params: SendEncryptedMessageParams): Promise<{ timestamp: number }> {

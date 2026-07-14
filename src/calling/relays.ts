@@ -1,34 +1,24 @@
-// TURN relay fetch for calling. Reuses the authenticated-chat `.fetch` pattern
-// from certificates.ts (Net.Net + connectAuthenticatedChat) to GET the Signal
-// service calling-relays endpoint and map the ICE server groups it returns.
-import { Net } from "@signalapp/libsignal-client";
+// TURN relay fetch for calling. Runs GET /v1/calling/relays over the caller's
+// EXISTING authenticated chat connection (the monitor's live client). Signal
+// permits only one authenticated socket per device, so opening a second
+// connection here would trigger a server-side ConnectedElsewhere that
+// disconnects the monitor mid-call — the fetch MUST be injected, not self-opened.
 import type { ChatRequest, RequestOptions } from "@signalapp/libsignal-client/dist/net/Chat.js";
 import type { ChatResponse } from "@signalapp/libsignal-client/dist/Native.js";
-import type { SignalAccountState, SignalEnvironment } from "../account.js";
-import { resolveLibsignalEnvironment } from "../account.js";
 import { SignalTsStateError } from "../errors.js";
 import type { TurnServer } from "./types.js";
 
-export type TurnRelaysConnection = {
-  fetch: (request: ChatRequest, options?: RequestOptions) => Promise<ChatResponse>;
-  disconnect: () => Promise<void>;
-};
-
-export type TurnRelaysConnectionFactory = (params: {
-  net: Net.Net;
-  account: SignalAccountState;
-  abortSignal?: AbortSignal;
-}) => Promise<TurnRelaysConnection>;
+/** Authenticated REST over the existing chat connection (SignalTsClient.fetchAuthenticated). */
+export type SignalAuthenticatedFetch = (
+  request: ChatRequest,
+  options?: RequestOptions,
+) => Promise<ChatResponse>;
 
 export type FetchTurnServersParams = {
-  account: SignalAccountState;
-  environment?: SignalEnvironment; // default "production"
-  userAgent?: string;
-  connectionFactory?: TurnRelaysConnectionFactory; // default mirrors certificates.ts factory
+  fetch: SignalAuthenticatedFetch;
   abortSignal?: AbortSignal;
 };
 
-const DEFAULT_USER_AGENT = "OpenClaw signal-ts/0.0.0";
 // Authenticated calling-relays endpoint. Response carries the short-lived ICE
 // server groups (STUN/TURN creds) RingRTC needs to negotiate the peer connection.
 const CALLING_RELAYS_PATH = "/v1/calling/relays";
@@ -40,57 +30,19 @@ const CALLING_RELAYS_PATH = "/v1/calling/relays";
  * Result is short-lived; the caller (manager) fetches once per call and does not cache.
  */
 export async function fetchTurnServers({
-  account,
-  environment = "production",
-  userAgent = DEFAULT_USER_AGENT,
-  connectionFactory = defaultTurnRelaysConnectionFactory,
+  fetch,
   abortSignal,
 }: FetchTurnServersParams): Promise<TurnServer[]> {
-  const net = new Net.Net({
-    env: resolveLibsignalEnvironment(environment),
-    userAgent,
-  });
-  const connection = await connectionFactory({
-    net,
-    account,
-    ...(abortSignal ? { abortSignal } : {}),
-  });
-  try {
-    const response = await connection.fetch(
-      {
-        verb: "GET",
-        path: CALLING_RELAYS_PATH,
-        headers: [["Accept", "application/json"]],
-        timeoutMillis: 30_000,
-      },
-      abortSignal ? { abortSignal } : undefined,
-    );
-    return parseTurnRelaysResponse(response);
-  } finally {
-    await connection.disconnect();
-  }
-}
-
-async function defaultTurnRelaysConnectionFactory({
-  net,
-  account,
-  abortSignal,
-}: {
-  net: Net.Net;
-  account: SignalAccountState;
-  abortSignal?: AbortSignal;
-}): Promise<TurnRelaysConnection> {
-  return await net.connectAuthenticatedChat(
-    account.auth.username,
-    account.auth.password,
-    account.receiveStories ?? false,
+  const response = await fetch(
     {
-      onConnectionInterrupted: () => {},
-      onIncomingMessage: (_envelope, _timestamp, ack) => ack.send(200),
-      onQueueEmpty: () => {},
+      verb: "GET",
+      path: CALLING_RELAYS_PATH,
+      headers: [["Accept", "application/json"]],
+      timeoutMillis: 30_000,
     },
     abortSignal ? { abortSignal } : undefined,
   );
+  return parseTurnRelaysResponse(response);
 }
 
 function parseTurnRelaysResponse(response: ChatResponse): TurnServer[] {

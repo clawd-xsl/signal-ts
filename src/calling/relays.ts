@@ -26,7 +26,8 @@ const CALLING_RELAYS_PATH = "/v2/calling/relays";
 
 /**
  * GET /v2/calling/relays. Parses `{ relays: [{ username, password, urls, urlsWithIps?, hostname? }] }`
- * (and tolerates a legacy flat single-relay object) into TurnServer[]. Throws
+ * (and tolerates a legacy flat single-relay object) into TurnServer[], splitting each
+ * relay into an IP-URL server and a hostname-URL server per the RingRTC contract. Throws
  * SignalTsStateError on non-2xx, missing/malformed body, or an empty server set.
  * Result is short-lived; the caller (manager) fetches once per call and does not cache.
  */
@@ -57,9 +58,7 @@ function parseTurnRelaysResponse(response: ChatResponse): TurnServer[] {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
     throw new SignalTsStateError("Calling relays response must be an object");
   }
-  const servers = extractRelayEntries(parsed as Record<string, unknown>)
-    .map(toTurnServer)
-    .filter((server): server is TurnServer => server !== undefined);
+  const servers = extractRelayEntries(parsed as Record<string, unknown>).flatMap(toTurnServers);
   if (servers.length === 0) {
     throw new SignalTsStateError("Calling relays response contained no usable ICE servers");
   }
@@ -82,22 +81,32 @@ function isRelayEntry(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function toTurnServer(entry: Record<string, unknown>): TurnServer | undefined {
-  // Merge plain hostnames and pre-resolved IP URLs into one list; RingRTC's
-  // iceServer accepts a flat url array and `hideIp` gates relay-only behavior.
-  const urls = [...readStringArray(entry["urls"]), ...readStringArray(entry["urlsWithIps"])];
-  if (urls.length === 0) {
-    return undefined;
-  }
+function toTurnServers(entry: Record<string, unknown>): TurnServer[] {
+  // RingRTC allows `hostname` only when the urls are raw IPs (it rejects the
+  // ice server otherwise and PeerConnection creation fails). Mirror
+  // Signal-Desktop: split each relay into an IP-URL server carrying hostname
+  // and a plain hostname-URL server without it, IP group first to avoid DNS.
   const username = readOptionalString(entry["username"]);
   const password = readOptionalString(entry["password"]);
   const hostname = readOptionalString(entry["hostname"]);
-  return {
-    urls,
+  const credentials = {
     ...(username !== undefined ? { username } : {}),
     ...(password !== undefined ? { password } : {}),
-    ...(hostname !== undefined ? { hostname } : {}),
   };
+  const servers: TurnServer[] = [];
+  const urlsWithIps = readStringArray(entry["urlsWithIps"]);
+  if (urlsWithIps.length > 0) {
+    servers.push({
+      urls: urlsWithIps,
+      ...credentials,
+      ...(hostname !== undefined ? { hostname } : {}),
+    });
+  }
+  const urls = readStringArray(entry["urls"]);
+  if (urls.length > 0) {
+    servers.push({ urls, ...credentials });
+  }
+  return servers;
 }
 
 function readStringArray(value: unknown): string[] {

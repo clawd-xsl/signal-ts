@@ -375,18 +375,20 @@ export function decodeSignalCallMessage(contentBytes: Bytes): SignalCallMessage 
 
   const message: SignalCallMessage = {};
   const offer = optionalRecord(callMessage["offer"]);
-  if (offer) {
+  const offerOpaque = offer ? decodedOpaque(offer["opaque"]) : undefined;
+  if (offer && offerOpaque) {
     message.offer = {
       callId: protoIdToCallId(offer["id"]),
       type: offerTypeFromProto(offer["type"]),
-      opaque: optionalOpaque(offer["opaque"]),
+      opaque: offerOpaque,
     };
   }
   const answer = optionalRecord(callMessage["answer"]);
-  if (answer) {
+  const answerOpaque = answer ? decodedOpaque(answer["opaque"]) : undefined;
+  if (answer && answerOpaque) {
     message.answer = {
       callId: protoIdToCallId(answer["id"]),
-      opaque: optionalOpaque(answer["opaque"]),
+      opaque: answerOpaque,
     };
   }
   const iceUpdate = optionalArray(callMessage["iceUpdate"]);
@@ -394,10 +396,11 @@ export function decodeSignalCallMessage(contentBytes: Bytes): SignalCallMessage 
     const candidates: NonNullable<SignalCallMessage["iceUpdate"]> = [];
     for (const entry of iceUpdate) {
       const record = optionalRecord(entry);
-      if (record) {
+      const opaque = record ? decodedOpaque(record["opaque"]) : undefined;
+      if (record && opaque) {
         candidates.push({
           callId: protoIdToCallId(record["id"]),
-          opaque: optionalOpaque(record["opaque"]),
+          opaque,
         });
       }
     }
@@ -418,8 +421,9 @@ export function decodeSignalCallMessage(contentBytes: Bytes): SignalCallMessage 
     };
   }
   const opaque = optionalRecord(callMessage["opaque"]);
-  if (opaque) {
-    const decoded: NonNullable<SignalCallMessage["opaque"]> = { data: optionalOpaque(opaque["data"]) };
+  const opaqueData = opaque ? decodedOpaque(opaque["data"]) : undefined;
+  if (opaque && opaqueData) {
+    const decoded: NonNullable<SignalCallMessage["opaque"]> = { data: opaqueData };
     const urgency = urgencyFromProto(opaque["urgency"]);
     if (urgency !== undefined) {
       decoded.urgency = urgency;
@@ -454,10 +458,12 @@ function protoIdToCallId(value: unknown): bigint {
   return 0n;
 }
 
-// opaque/data are `bytes` fields required by SignalCallMessage; a well-formed CallMessage always
-// carries them. Copy out of the decode buffer, defaulting to empty for degenerate inputs.
-function optionalOpaque(value: unknown): Bytes {
-  return value instanceof Uint8Array ? copyBytes(value) : copyBytes(new Uint8Array(0));
+// opaque/data are required bytes on the wire. Entries missing them are dropped
+// by the decoder (like Signal-Desktop) instead of fabricated as empty: RingRTC's
+// own fallback guard is `!opaque`, which an empty Uint8Array would sail past
+// straight into the native deserializer.
+function decodedOpaque(value: unknown): Bytes | undefined {
+  return value instanceof Uint8Array ? copyBytes(value) : undefined;
 }
 
 function offerTypeToProto(type: NonNullable<SignalCallMessage["offer"]>["type"]): number {

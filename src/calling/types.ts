@@ -16,6 +16,8 @@ export type CallState = "idle" | "ringing" | "connecting" | "connected" | "ended
 export type CallEndReason =
   | "local-hangup"
   | "remote-hangup"
+  // Callee's message-request gate blocked the call (they lack our profile key).
+  | "need-permission"
   | "declined"
   | "busy"
   | "glare"

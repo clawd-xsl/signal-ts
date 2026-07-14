@@ -4,14 +4,14 @@
 // dynamic import() cast to our own RingRtcModuleExports interface (ringrtc-types.ts)
 // so tsc never resolves the specifier and the build is identical whether or not the
 // optionalDependency is installed.
-import { Aci, ProtocolAddress } from "@signalapp/libsignal-client";
+import { Aci, ProtocolAddress, type PreKeyBundle } from "@signalapp/libsignal-client";
 import type { SignalAccountState } from "../account.js";
 import type { Bytes } from "../bytes.js";
 import type { SignalLogger, SignalTsClient } from "../client.js";
 import { SignalTsCallingUnavailableError, SignalTsStateError } from "../errors.js";
 import { createCallSignalContent } from "../messages.js";
 import type { SignalCallMessage, SignalContent } from "../messages.js";
-import type { PreKeyAuth } from "../prekeys.js";
+import { fetchRecipientPreKeys, type PreKeyAuth } from "../prekeys.js";
 import type { LibsignalStores } from "../store.js";
 import {
   defaultSignalCallAudioDeviceNames,
@@ -64,7 +64,16 @@ async function loadRingRtcModule(): Promise<RingRtcModuleExports> {
   return await ringRtcPromise;
 }
 
+// RingRTC arms its own 60s terminal timer for both directions (CallEndReason
+// Timeout), so values above 60s here never fire; only shorter values matter.
 const DEFAULT_OUTGOING_RING_TIMEOUT_MS = 60_000;
+// RingRTC serializes 1:1 signaling: the next message dispatches only after the
+// handleOutgoingSignaling promise settles, so one hung send wedges the whole
+// offer/ICE flow. Desktop bounds every send the same way (OUTGOING_SIGNALING_WAIT).
+const OUTGOING_SIGNALING_WAIT_MS = 15_000;
+// close(): bounded wait for RingRTC's worker to hand over + send the final
+// hangup before the signaling hook is released.
+const CLOSE_HANGUP_DRAIN_MS = 2_000;
 // RingRTC honors AcceptCall only in ConnectedBeforeAccepted (public state
 // "ringing"); accept() waits for that transition. ICE normally connects within
 // seconds and a call that never connects ends through its own failure path, so
@@ -138,6 +147,11 @@ export class SignalCallManager {
   private pendingIncomingPeer: { callId: CallId; peer: SignalCallPeer } | undefined;
   // Latest media teardown so close() can await device release before nulling RingRTC hooks.
   private pendingTeardown: Promise<void> | undefined;
+  // True from requesting a hangup/decline until the resulting Hangup message has
+  // been handed to handleOutgoingSignaling and sent (or failed). RingRTC hands it
+  // over asynchronously, so close() must drain this before releasing the hook or
+  // the remote keeps ringing until RingRTC's 60s timeout.
+  private pendingHangupSignal = false;
   private readonly listeners = new Set<(event: SignalCallEvent) => void>();
 
   constructor(private readonly deps: SignalCallManagerDeps) {}
@@ -228,7 +242,15 @@ export class SignalCallManager {
         return;
       }
       if (call.offer) {
-        this.pendingIncomingPeer = { callId: call.offer.callId, peer: sender };
+        // RingRTC drops offers addressed to another device (destinationDeviceId
+        // mismatch, Service.ts guard); don't stash a peer for a call that will
+        // never surface through onIncomingCall.
+        const targetedHere =
+          call.destinationDeviceId === undefined ||
+          call.destinationDeviceId === this.deps.config.localDeviceId;
+        if (targetedHere) {
+          this.pendingIncomingPeer = { callId: call.offer.callId, peer: sender };
+        }
       }
       const callingMessage = signalToRingRtcCallingMessage(mod, call);
       const options: RingRtcHandleCallingMessageOptions = {
@@ -319,6 +341,7 @@ export class SignalCallManager {
       this.deps.logger?.warn?.(`signal-call decline: no active call matching ${callId}`);
       return;
     }
+    this.pendingHangupSignal = true;
     this.safeRingRtcCall((rtc) => rtc.decline(callId));
     this.finalizeCall(active, "declined");
   }
@@ -357,6 +380,10 @@ export class SignalCallManager {
     if (active && !active.ended) {
       this.endCall(active, "local-hangup", true);
     }
+    // RingRTC hands the final Hangup to handleOutgoingSignaling asynchronously
+    // (worker + deferred dispatch). Nulling the hook first hits RingRTC's
+    // null-hook branch (signalingMessageSendFailed) and the remote rings on.
+    await this.drainPendingHangupSignal();
     if (this.pendingTeardown) {
       await this.pendingTeardown;
     }
@@ -370,6 +397,13 @@ export class SignalCallManager {
     this.listeners.clear();
     this.readyPromise = undefined;
     this.module = undefined;
+  }
+
+  private async drainPendingHangupSignal(): Promise<void> {
+    const deadline = Date.now() + CLOSE_HANGUP_DRAIN_MS;
+    while (this.pendingHangupSignal && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
   }
 
   // --- RingRTC callbacks -----------------------------------------------------
@@ -389,12 +423,46 @@ export class SignalCallManager {
     try {
       const signalCall = ringRtcCallingMessageToSignal(message);
       const content = createCallSignalContent(signalCall);
-      // Offer/answer/hangup/busy must not be dropped by the server under load; loose ice
-      // trickle can be droppable. Mirrors Signal's urgent-vs-droppable CallMessage handling.
-      const urgent = Boolean(message.offer || message.answer || message.hangup || message.busy);
-      await this.deps.send.sendCallMessage({ recipientAci: remoteUserId, content, urgent });
+      // Only the offer is urgent: it must wake sleeping recipient devices.
+      // Desktop: "We want 1:1 call initiate messages to wake up recipient
+      // devices, but not others" — answer/ice/hangup/busy ride normal priority.
+      const urgent = Boolean(message.offer);
+      // Bound the send (Desktop's OUTGOING_SIGNALING_WAIT): RingRTC dispatches
+      // the next signaling message only after this promise settles, so a hung
+      // send would wedge the offer/ICE flow; false fails the call cleanly.
+      const sendPromise = this.deps.send.sendCallMessage({
+        recipientAci: remoteUserId,
+        content,
+        urgent,
+      });
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const outcome = await Promise.race([
+          sendPromise.then(() => "sent" as const),
+          new Promise<"timeout">((resolve) => {
+            timer = setTimeout(() => resolve("timeout"), OUTGOING_SIGNALING_WAIT_MS);
+          }),
+        ]);
+        if (outcome === "timeout") {
+          // The late settlement must not surface as an unhandled rejection.
+          sendPromise.catch(() => {});
+          throw new SignalTsStateError(
+            `signal-call signaling send timed out after ${OUTGOING_SIGNALING_WAIT_MS}ms`,
+          );
+        }
+      } finally {
+        if (timer !== undefined) {
+          clearTimeout(timer);
+        }
+      }
+      if (message.hangup) {
+        this.pendingHangupSignal = false;
+      }
       return true;
     } catch (err) {
+      if (message.hangup) {
+        this.pendingHangupSignal = false;
+      }
       // Returning false makes RingRTC call signalingMessageSendFailed and tear the call down.
       this.emitError(this.active?.callId, toError(err));
       return false;
@@ -596,6 +664,7 @@ export class SignalCallManager {
       return;
     }
     if (sendHangup) {
+      this.pendingHangupSignal = true;
       this.safeRingRtcCall((rtc) => rtc.hangup(active.callId));
     }
     this.finalizeCall(active, reason);
@@ -750,15 +819,30 @@ export function createSignalCallManager(params: {
     selfAci: account.device.aci,
     ...(params.config ?? {}),
   };
+  // Single-slot prekey-bundle cache: RingRTC serializes signaling, and without
+  // this every offer/ICE/hangup pays a fresh unauthenticated connect + /v2/keys
+  // fetch (seconds of setup latency) and drains the peer's one-time prekeys.
+  // Cached bundles are inert once sessions exist (only deviceId/registrationId
+  // are read), and a device change self-heals: the 409 mismatch repair inside
+  // sendContentMessage refetches fresh bundles.
+  let cachedPreKeys: { recipientAci: string; bundles: PreKeyBundle[] } | undefined;
   const send: SignalCallSendDeps = {
     sendCallMessage: async ({ recipientAci, content, urgent }) => {
       // Reuses the full content-send path (per-device fan-out + mismatch repair, urgent flag).
       const preKeyAuth = await params.resolvePreKeyAuth?.(recipientAci);
+      if (cachedPreKeys?.recipientAci !== recipientAci) {
+        const fetched = await fetchRecipientPreKeys({
+          target: recipientAci,
+          ...(preKeyAuth !== undefined ? { auth: preKeyAuth } : {}),
+        });
+        cachedPreKeys = { recipientAci, bundles: fetched.preKeyBundles };
+      }
       await client.sendContentMessage({
         destination: recipientAci,
         content,
         stores,
         urgent,
+        preKeyBundles: cachedPreKeys.bundles,
         ...(preKeyAuth !== undefined ? { preKeyAuth } : {}),
       });
     },
@@ -766,12 +850,12 @@ export function createSignalCallManager(params: {
   const identity: SignalCallIdentityResolver = {
     localIdentityKey: async () => {
       const key = await stores.identityStore.getIdentityKey();
-      return key.getPublicKey().serialize();
+      return toRingRtcIdentityKey(key.getPublicKey().serialize());
     },
     remoteIdentityKey: async (aci, deviceId) => {
       const address = ProtocolAddress.new(Aci.fromUuid(aci), deviceId);
       const key = await stores.identityStore.getIdentity(address);
-      return key?.serialize() ?? null;
+      return key ? toRingRtcIdentityKey(key.serialize()) : null;
     },
   };
   return new SignalCallManager({
@@ -790,6 +874,19 @@ export function createSignalCallManager(params: {
 
 function aciToBytes(aci: string): Bytes {
   return Aci.fromUuid(aci).getRawUuidBytes();
+}
+
+// libsignal serializes public keys with a leading DJB type byte (0x05, 33 bytes
+// total); RingRTC derives the call's frame crypto from the raw 32-byte
+// Curve25519 key, so a prefixed key breaks SRTP/SRTCP ("Failed to unprotect").
+// Signal-Desktop strips the header the same way (calling.preload.ts
+// "Ignore the type header"). Pass already-raw keys through untouched.
+const DJB_KEY_TYPE = 0x05;
+function toRingRtcIdentityKey(serialized: Uint8Array): Bytes {
+  if (serialized.length === 33 && serialized[0] === DJB_KEY_TYPE) {
+    return serialized.subarray(1) as Bytes;
+  }
+  return serialized as Bytes;
 }
 
 function turnToIceServer(turn: TurnServer): RingRtcIceServer {
@@ -842,6 +939,9 @@ function ringRtcCallingMessageToSignal(message: RingRtcCallingMessage): SignalCa
 
 // Inbound: decoded Signal wire CallMessage -> RingRTC CallingMessage built via the module
 // constructors so RingRTC.handleCallingMessage sees native instances.
+// Inbound `opaque` CallMessages (group-call rings, call links) are intentionally
+// NOT mapped: this module is 1:1-audio-only and installs no group handlers, so
+// forwarding them would only hit RingRTC's unset-handler warnings.
 function signalToRingRtcCallingMessage(
   mod: RingRtcModuleExports,
   call: SignalCallMessage,
@@ -922,9 +1022,13 @@ function mapCallEndReason(code: number | undefined): CallEndReason {
     case 14: // DeviceExplicitlyDisconnected
       return "local-hangup";
     case 1: // RemoteHangup
-    case 2: // RemoteHangupNeedPermission
     case 3: // RemoteHangupAccepted (elsewhere)
       return "remote-hangup";
+    case 2: // RemoteHangupNeedPermission: callee's message-request gate blocked
+      // the call (they lack our profile key). Distinct so hosts can react
+      // (send profile key / surface the real failure) instead of seeing an
+      // ordinary hangup.
+      return "need-permission";
     case 4: // RemoteHangupDeclined
       return "declined";
     case 5: // RemoteHangupBusy

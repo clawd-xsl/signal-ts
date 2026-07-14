@@ -88,6 +88,8 @@ export interface RingRtcCallSettings {
   hideIp: boolean;
   dataMode: RingRtcDataMode;
   audioLevelsIntervalMillis?: number;
+  // DRED packet-loss audio redundancy duration; RingRTC defaults it to 0 (off).
+  dredDuration?: number;
 }
 
 export interface RingRtcCall {

@@ -11,6 +11,7 @@ import type { SignalLogger, SignalTsClient } from "../client.js";
 import { SignalTsCallingUnavailableError, SignalTsStateError } from "../errors.js";
 import { createCallSignalContent } from "../messages.js";
 import type { SignalCallMessage, SignalContent } from "../messages.js";
+import type { PreKeyAuth } from "../prekeys.js";
 import type { LibsignalStores } from "../store.js";
 import {
   defaultSignalCallAudioDeviceNames,
@@ -673,6 +674,10 @@ export function createSignalCallManager(params: {
   client: SignalTsClient;
   account: SignalAccountState;
   stores: Pick<LibsignalStores, "identityStore" | "sessionStore">;
+  // Per-recipient prekey auth (access key) for call signaling sends, same as
+  // the host resolves for normal messages; without it the prekey fetch before
+  // the first signaling send is rejected (RequestUnauthorized).
+  resolvePreKeyAuth?: (recipientAci: string) => Promise<PreKeyAuth | undefined>;
   config?: Partial<
     Pick<
       SignalCallManagerConfig,
@@ -690,7 +695,14 @@ export function createSignalCallManager(params: {
   const send: SignalCallSendDeps = {
     sendCallMessage: async ({ recipientAci, content, urgent }) => {
       // Reuses the full content-send path (per-device fan-out + mismatch repair, urgent flag).
-      await client.sendContentMessage({ destination: recipientAci, content, stores, urgent });
+      const preKeyAuth = await params.resolvePreKeyAuth?.(recipientAci);
+      await client.sendContentMessage({
+        destination: recipientAci,
+        content,
+        stores,
+        urgent,
+        ...(preKeyAuth !== undefined ? { preKeyAuth } : {}),
+      });
     },
   };
   const identity: SignalCallIdentityResolver = {

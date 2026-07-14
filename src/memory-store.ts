@@ -66,6 +66,10 @@ export class InMemorySignalRepository implements SignalRepository {
     this.sessions.set(address, record);
   }
 
+  async removeSession(address: string): Promise<void> {
+    this.sessions.delete(address);
+  }
+
   async getPreKey(id: number): Promise<PreKeyRecord | null> {
     return this.preKeys.get(id) ?? null;
   }

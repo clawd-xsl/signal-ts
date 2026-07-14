@@ -190,6 +190,11 @@ export class FileSignalRepository implements SignalRepository {
     await this.persist();
   }
 
+  async removeSession(address: string): Promise<void> {
+    this.sessions.delete(address);
+    await this.persist();
+  }
+
   async getPreKey(id: number): Promise<PreKeyRecord | null> {
     return this.preKeys.get(id) ?? null;
   }

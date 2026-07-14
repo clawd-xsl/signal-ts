@@ -1,13 +1,29 @@
-import { Aci } from "@signalapp/libsignal-client";
+import {
+  Aci,
+  ErrorCode,
+  KEMKeyPair,
+  KyberPreKeyRecord,
+  MismatchedDevicesEntry,
+  PreKeyBundle,
+  PreKeyRecord,
+  PrivateKey,
+  ProtocolAddress,
+  SignedPreKeyRecord,
+  type SessionRecord,
+} from "@signalapp/libsignal-client";
 import type { SingleOutboundUnsealedMessage } from "@signalapp/libsignal-client/dist/net/chat/SingleOutboundMessage.js";
 import { describe, expect, it, vi } from "vitest";
+import type { SignalAccountState } from "./account.js";
 import {
   SignalTsClient,
   type SendContentMessageParams,
   type UploadAttachmentParams,
   type SignalChatConnection,
 } from "./client.js";
+import { encryptPayloadForDevice } from "./crypto.js";
+import { InMemorySignalRepository } from "./memory-store.js";
 import type { SignalAttachmentPointer, SignalContent } from "./messages.js";
+import { createLibsignalStores, type LibsignalStores } from "./store.js";
 
 const UTF8_DECODER = new TextDecoder();
 const LONG_TEXT_CONTENT_TYPE = "text/x-signal-plain";
@@ -35,6 +51,85 @@ function createContentParams(traceId: string, timestamp: number): SendContentMes
     timestamp,
     content: { nullMessage: { padding: new Uint8Array() } },
     stores: {} as SendContentMessageParams["stores"],
+  };
+}
+
+function createFakePreKeyBundle(deviceId: number, registrationId: number): PreKeyBundle {
+  return {
+    deviceId: () => deviceId,
+    registrationId: () => registrationId,
+  } as unknown as PreKeyBundle;
+}
+
+type GeneratedAccount = {
+  account: SignalAccountState;
+  repository: InMemorySignalRepository;
+  stores: LibsignalStores;
+  localAddress: ProtocolAddress;
+  serviceId: ReturnType<typeof Aci.fromUuid>;
+  preKeyBundle: PreKeyBundle;
+};
+
+async function createGeneratedAccount({
+  aci,
+  deviceId,
+  registrationId,
+}: {
+  aci: string;
+  deviceId: number;
+  registrationId: number;
+}): Promise<GeneratedAccount> {
+  const identityKey = PrivateKey.generate();
+  const repository = new InMemorySignalRepository({ identityKey, registrationId });
+  const preKeyId = 1;
+  const preKey = PrivateKey.generate();
+  const signedPreKeyId = 1;
+  const signedPreKey = PrivateKey.generate();
+  const signedPreKeySignature = identityKey.sign(signedPreKey.getPublicKey().serialize());
+  const kyberPreKeyId = 1;
+  const kyberKeyPair = KEMKeyPair.generate();
+  const kyberPreKeySignature = identityKey.sign(kyberKeyPair.getPublicKey().serialize());
+  await repository.savePreKey(
+    preKeyId,
+    PreKeyRecord.new(preKeyId, preKey.getPublicKey(), preKey),
+  );
+  await repository.saveSignedPreKey(
+    signedPreKeyId,
+    SignedPreKeyRecord.new(
+      signedPreKeyId,
+      Date.now(),
+      signedPreKey.getPublicKey(),
+      signedPreKey,
+      signedPreKeySignature,
+    ),
+  );
+  await repository.saveKyberPreKey(
+    kyberPreKeyId,
+    KyberPreKeyRecord.new(kyberPreKeyId, Date.now(), kyberKeyPair, kyberPreKeySignature),
+  );
+  const account: SignalAccountState = {
+    auth: { username: `${aci}.${deviceId}`, password: "unused" },
+    device: { aci, deviceId, registrationId },
+  };
+  return {
+    account,
+    repository,
+    stores: createLibsignalStores(repository),
+    localAddress: ProtocolAddress.new(Aci.fromUuid(aci), deviceId),
+    serviceId: Aci.fromUuid(aci),
+    preKeyBundle: PreKeyBundle.new(
+      registrationId,
+      deviceId,
+      preKeyId,
+      preKey.getPublicKey(),
+      signedPreKeyId,
+      signedPreKey.getPublicKey(),
+      signedPreKeySignature,
+      identityKey.getPublicKey(),
+      kyberPreKeyId,
+      kyberKeyPair.getPublicKey(),
+      kyberPreKeySignature,
+    ),
   };
 }
 
@@ -135,6 +230,179 @@ describe("SignalTsClient", () => {
       undefined,
     );
     expect(disconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it("refreshes every direct session when the mismatch entry has no device details", async () => {
+    const destination = Aci.fromUuid("22222222-2222-4222-8222-222222222222");
+    const mismatch = Object.assign(new Error("Mismatched devices for recipient"), {
+      code: ErrorCode.MismatchedDevices,
+      entries: [new MismatchedDevicesEntry({ account: destination })],
+    });
+    const sendMessage = vi.fn(async (_request: Parameters<SignalChatConnection["sendMessage"]>[0]) => {
+      if (sendMessage.mock.calls.length === 1) {
+        throw mismatch;
+      }
+    });
+    const connection: SignalChatConnection = {
+      sendMessage,
+      disconnect: vi.fn(async () => {}),
+      connectionInfo: () => ({ localPort: 1, ipVersion: "IPv4", toString: () => "fake" }),
+    };
+    const client = new SignalTsClient({
+      account: {
+        auth: { username: "user.1", password: "pass" },
+        device: {
+          aci: "11111111-1111-4111-8111-111111111111",
+          deviceId: 1,
+          registrationId: 42,
+        },
+      },
+      connectionFactory: async () => connection,
+    });
+    const initialBundle = createFakePreKeyBundle(1, 287);
+    const currentBundles = [initialBundle, createFakePreKeyBundle(2, 288)];
+    const fetchPreKeyBundles = vi.fn(async () => currentBundles);
+    type BuildContentsParams = {
+      preKeyBundles: PreKeyBundle[];
+      refreshDeviceIds?: ReadonlySet<number>;
+    };
+    const buildDirectContentMessageContents = vi.fn(
+      async ({ preKeyBundles }: BuildContentsParams): Promise<SingleOutboundUnsealedMessage[]> =>
+        preKeyBundles.map((bundle) => ({
+          deviceId: bundle.deviceId(),
+          registrationId: bundle.registrationId(),
+          contents: {} as SingleOutboundUnsealedMessage["contents"],
+        })),
+    );
+    const clientInternals = client as unknown as {
+      fetchPreKeyBundles: typeof fetchPreKeyBundles;
+      buildDirectContentMessageContents: typeof buildDirectContentMessageContents;
+    };
+    clientInternals.fetchPreKeyBundles = fetchPreKeyBundles;
+    clientInternals.buildDirectContentMessageContents = buildDirectContentMessageContents;
+
+    await client.connect();
+    await client.sendContentMessage({
+      traceId: "content-empty-mismatch",
+      destination,
+      timestamp: 123,
+      content: { nullMessage: { padding: new Uint8Array() } },
+      stores: {} as SendContentMessageParams["stores"],
+      preKeyBundles: [initialBundle],
+    });
+
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+    expect(fetchPreKeyBundles).toHaveBeenCalledTimes(1);
+    expect(sendMessage.mock.calls[1]?.[0].contents.map((content) => content.deviceId)).toEqual([
+      1,
+      2,
+    ]);
+    const retryBuild = buildDirectContentMessageContents.mock.calls[1]?.[0];
+    expect([...(retryBuild?.refreshDeviceIds ?? [])]).toEqual([1, 2]);
+  });
+
+  it("repairs mismatched devices and retries retry receipts", async () => {
+    const destination = Aci.fromUuid("22222222-2222-4222-8222-222222222222");
+    const sender = await createGeneratedAccount({
+      aci: "11111111-1111-4111-8111-111111111111",
+      deviceId: 1,
+      registrationId: 42,
+    });
+    const receiver = await createGeneratedAccount({
+      aci: destination.getServiceIdString(),
+      deviceId: 1,
+      registrationId: 287,
+    });
+    const deviceMessage = await encryptPayloadForDevice({
+      localAddress: sender.localAddress,
+      device: {
+        serviceId: receiver.serviceId,
+        deviceId: receiver.account.device.deviceId,
+        registrationId: receiver.account.device.registrationId,
+        preKeyBundle: receiver.preKeyBundle,
+      },
+      payload: new Uint8Array([1, 2, 3]),
+      stores: sender.stores,
+    });
+    const mismatch = Object.assign(new Error("Mismatched devices for recipient"), {
+      code: ErrorCode.MismatchedDevices,
+      entries: [
+        new MismatchedDevicesEntry({
+          account: destination,
+          missingDevices: [2],
+          extraDevices: [4],
+          staleDevices: [1],
+        }),
+      ],
+    });
+    const sendMessage = vi.fn(async (_request: Parameters<SignalChatConnection["sendMessage"]>[0]) => {
+      if (sendMessage.mock.calls.length === 1) {
+        throw mismatch;
+      }
+    });
+    const connection: SignalChatConnection = {
+      sendMessage,
+      disconnect: vi.fn(async () => {}),
+      connectionInfo: () => ({ localPort: 1, ipVersion: "IPv4", toString: () => "fake" }),
+    };
+    const client = new SignalTsClient({
+      account: {
+        auth: { username: "user.1", password: "pass" },
+        device: {
+          aci: "11111111-1111-4111-8111-111111111111",
+          deviceId: 1,
+          registrationId: 42,
+        },
+      },
+      connectionFactory: async () => connection,
+    });
+    const currentBundles = [createFakePreKeyBundle(1, 287), createFakePreKeyBundle(2, 288)];
+    const fetchPreKeyBundles = vi.fn(async () => currentBundles);
+    (
+      client as unknown as {
+        fetchPreKeyBundles: typeof fetchPreKeyBundles;
+      }
+    ).fetchPreKeyBundles = fetchPreKeyBundles;
+    const removeSession = vi.fn(async (_address: ProtocolAddress) => {});
+    const sessionStore = {
+      getSession: vi.fn(async (address: ProtocolAddress) => {
+        if (address.deviceId() !== 1) {
+          return null;
+        }
+        return { remoteRegistrationId: () => 287 } as unknown as SessionRecord;
+      }),
+      saveSession: vi.fn(async () => {}),
+      getExistingSessions: vi.fn(async () => []),
+      removeSession,
+    };
+
+    await client.connect();
+    await client.sendRetryReceiptMessage({
+      traceId: "retry-mismatch",
+      destination,
+      timestamp: 123,
+      retry: {
+        recipientServiceId: destination.getServiceIdString(),
+        senderDeviceId: 1,
+        timestamp: 99,
+        ciphertextType: deviceMessage.contents.type(),
+        originalContent: deviceMessage.contents.serialize(),
+      },
+      stores: {
+        sessionStore: sessionStore as Parameters<SignalTsClient["sendRetryReceiptMessage"]>[0]["stores"]["sessionStore"],
+        identityStore: {} as Parameters<SignalTsClient["sendRetryReceiptMessage"]>[0]["stores"]["identityStore"],
+      },
+      preKeyBundles: [createFakePreKeyBundle(1, 287)],
+    });
+
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+    expect(fetchPreKeyBundles).toHaveBeenCalledTimes(1);
+    expect(sendMessage.mock.calls[0]?.[0].contents.map((content) => content.deviceId)).toEqual([1]);
+    expect(sendMessage.mock.calls[1]?.[0].contents.map((content) => content.deviceId)).toEqual([
+      1,
+      2,
+    ]);
+    expect(removeSession.mock.calls.map(([address]) => address.deviceId())).toEqual([1, 4]);
   });
 
   it("sends encrypted sync payloads through the authenticated connection", async () => {

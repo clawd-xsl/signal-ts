@@ -1,9 +1,12 @@
 import {
   Aci,
+  ErrorCode,
   Net,
   ProtocolAddress,
   SenderCertificate,
   SenderKeyDistributionMessage,
+  type MismatchedDevicesEntry,
+  type MismatchedDevicesError,
   type PreKeyBundle,
   ServiceId,
   groupEncrypt,
@@ -168,7 +171,10 @@ export type SendContentMessageParams = {
 export type SendRetryReceiptMessageParams = {
   destination: SignalRecipientTarget;
   retry: SignalRetryReceiptRequest;
-} & Omit<SendContentMessageBaseParams, "preKeyBundles" | "preKeyAuth">;
+} & Omit<SendContentMessageBaseParams, "preKeyBundles" | "preKeyAuth"> & {
+  preKeyBundles?: PreKeyBundle[];
+  preKeyAuth?: PreKeyAuth;
+};
 
 export type SendSealedContentMessageParams = {
   destination: SignalRecipientTarget;
@@ -424,6 +430,54 @@ function describePreKeyBundleDevices(preKeyBundles: ReadonlyArray<PreKeyBundle>)
     .join(",");
 }
 
+type MismatchedDeviceListName = "missingDevices" | "extraDevices" | "staleDevices";
+
+type DeviceMismatchRepair = {
+  refreshDeviceIds: Set<number>;
+  refreshAllDevices: boolean;
+};
+
+type SessionStoreWithRemoval = Pick<LibsignalStores["sessionStore"], "getSession" | "saveSession"> & {
+  removeSession?: (address: ProtocolAddress) => Promise<void>;
+};
+
+function isMismatchedDevicesError(err: unknown): err is MismatchedDevicesError {
+  if (typeof err !== "object" || err === null) {
+    return false;
+  }
+  const candidate = err as Partial<MismatchedDevicesError>;
+  return candidate.code === ErrorCode.MismatchedDevices && Array.isArray(candidate.entries);
+}
+
+function filterMismatchedEntries(
+  entries: ReadonlyArray<MismatchedDevicesEntry>,
+  destination: ServiceId,
+): MismatchedDevicesEntry[] {
+  const destinationKey = describeServiceId(destination).toLowerCase();
+  return entries.filter((entry) => describeServiceId(entry.account).toLowerCase() === destinationKey);
+}
+
+function collectMismatchedDeviceIds(
+  entries: ReadonlyArray<MismatchedDevicesEntry>,
+  name: MismatchedDeviceListName,
+): Set<number> {
+  const deviceIds = new Set<number>();
+  for (const entry of entries) {
+    for (const deviceId of entry[name]) {
+      deviceIds.add(deviceId);
+    }
+  }
+  return deviceIds;
+}
+
+function sortedDeviceIds(deviceIds: ReadonlySet<number>): number[] {
+  return [...deviceIds].sort((left, right) => left - right);
+}
+
+function describeDeviceIds(deviceIds: ReadonlySet<number>): string {
+  return deviceIds.size === 0 ? "none" : sortedDeviceIds(deviceIds).join(",");
+}
+
 function describeAttachmentInput(attachment: SignalAttachmentInput): string {
   return [
     `bytes=${attachment.data.byteLength}`,
@@ -547,6 +601,219 @@ export class SignalTsClient {
     } finally {
       release();
     }
+  }
+
+  private async repairMismatchedDevices({
+    err,
+    traceId,
+    operation,
+    destination,
+    stores,
+  }: {
+    err: MismatchedDevicesError;
+    traceId: string;
+    operation: string;
+    destination: ServiceId;
+    stores: Pick<LibsignalStores, "sessionStore">;
+  }): Promise<DeviceMismatchRepair | null> {
+    const entries = filterMismatchedEntries(err.entries, destination);
+    if (entries.length === 0) {
+      return null;
+    }
+
+    const missingDeviceIds = collectMismatchedDeviceIds(entries, "missingDevices");
+    const extraDeviceIds = collectMismatchedDeviceIds(entries, "extraDevices");
+    const staleDeviceIds = collectMismatchedDeviceIds(entries, "staleDevices");
+    const refreshAllDevices = entries.some(
+      (entry) =>
+        entry.missingDevices.length === 0 &&
+        entry.extraDevices.length === 0 &&
+        entry.staleDevices.length === 0,
+    );
+    this.logWarn(
+      [
+        `${traceId} ${operation} device-mismatch`,
+        `destination=${describeServiceId(destination)}`,
+        `missing=${describeDeviceIds(missingDeviceIds)}`,
+        `extra=${describeDeviceIds(extraDeviceIds)}`,
+        `stale=${describeDeviceIds(staleDeviceIds)}`,
+      ].join(" "),
+    );
+
+    const devicesToDrop = new Set([...extraDeviceIds, ...staleDeviceIds]);
+    for (const deviceId of sortedDeviceIds(devicesToDrop)) {
+      await this.removeRecipientSessionDevice({
+        traceId,
+        operation,
+        destination,
+        deviceId,
+        sessionStore: stores.sessionStore,
+      });
+    }
+
+    return {
+      refreshDeviceIds: new Set([...missingDeviceIds, ...staleDeviceIds]),
+      refreshAllDevices,
+    };
+  }
+
+  private async removeRecipientSessionDevice({
+    traceId,
+    operation,
+    destination,
+    deviceId,
+    sessionStore,
+  }: {
+    traceId: string;
+    operation: string;
+    destination: ServiceId;
+    deviceId: number;
+    sessionStore: LibsignalStores["sessionStore"];
+  }): Promise<void> {
+    const address = ProtocolAddress.new(destination, deviceId);
+    const removableSessionStore = sessionStore as SessionStoreWithRemoval;
+    if (removableSessionStore.removeSession) {
+      await removableSessionStore.removeSession(address);
+      this.logDebug(
+        `${traceId} ${operation} session removed destination=${describeServiceId(destination)} device=${deviceId}`,
+      );
+      return;
+    }
+
+    const session = await removableSessionStore.getSession(address);
+    if (!session) {
+      this.logDebug(
+        `${traceId} ${operation} session remove skipped destination=${describeServiceId(destination)} device=${deviceId} existingSession=no`,
+      );
+      return;
+    }
+    session.archiveCurrentState();
+    await removableSessionStore.saveSession(address, session);
+    this.logDebug(
+      `${traceId} ${operation} session archived destination=${describeServiceId(destination)} device=${deviceId}`,
+    );
+  }
+
+  private async buildDirectContentMessageContents({
+    traceId,
+    operation,
+    destination,
+    payload,
+    stores,
+    preKeyBundles,
+    refreshDeviceIds,
+  }: {
+    traceId: string;
+    operation: string;
+    destination: ServiceId;
+    payload: Uint8Array<ArrayBuffer>;
+    stores: Pick<LibsignalStores, "identityStore" | "sessionStore">;
+    preKeyBundles: PreKeyBundle[];
+    refreshDeviceIds?: ReadonlySet<number>;
+  }): Promise<Array<SendMessageRequest["contents"][number]>> {
+    const localAddress = this.localAddress();
+    const contents: Array<SendMessageRequest["contents"][number]> = [];
+    for (const bundle of preKeyBundles) {
+      const deviceId = bundle.deviceId();
+      const remoteAddress = ProtocolAddress.new(destination, deviceId);
+      const refreshSession = refreshDeviceIds?.has(deviceId) ?? false;
+      const existingSession = refreshSession
+        ? null
+        : await stores.sessionStore.getSession(remoteAddress);
+      this.logDebug(
+        `${traceId} ${operation} encrypt device=${deviceId} registration=${bundle.registrationId()} existingSession=${existingSession ? "yes" : "no"} refreshSession=${refreshSession ? "yes" : "no"}`,
+      );
+      const device = {
+        serviceId: destination,
+        deviceId,
+        registrationId: bundle.registrationId(),
+      };
+      if (!existingSession || refreshSession) {
+        Object.assign(device, { preKeyBundle: bundle });
+      }
+      const encrypted = await encryptPayloadForDevice({
+        localAddress,
+        device,
+        payload,
+        stores,
+      });
+      this.logDebug(
+        `${traceId} ${operation} encrypted device=${encrypted.deviceId} registration=${encrypted.registrationId} ciphertextType=${encrypted.contents.type()}`,
+      );
+      contents.push(encrypted);
+    }
+    return contents;
+  }
+
+  private async buildRetryReceiptContentsForDevice({
+    traceId,
+    destination,
+    retry,
+    stores,
+    preKeyBundles,
+    preKeyAuth,
+    abortSignal,
+  }: {
+    traceId: string;
+    destination: ServiceId;
+    retry: SignalRetryReceiptRequest;
+    stores: Pick<LibsignalStores, "sessionStore">;
+    preKeyBundles?: PreKeyBundle[];
+    preKeyAuth?: PreKeyAuth;
+    abortSignal?: AbortSignal;
+  }): Promise<Array<SendMessageRequest["contents"][number]>> {
+    const remoteAddress = ProtocolAddress.new(destination, retry.senderDeviceId);
+    const session = await stores.sessionStore.getSession(remoteAddress);
+    if (session) {
+      this.logDebug(
+        `${traceId} retry-receipt session destination=${describeServiceId(destination)} senderDevice=${retry.senderDeviceId} registration=${session.remoteRegistrationId()} source=session`,
+      );
+      return [
+        {
+          deviceId: retry.senderDeviceId,
+          registrationId: session.remoteRegistrationId(),
+          contents: createSignalDecryptionErrorPlaintextContent(retry).asCiphertextMessage(),
+        },
+      ];
+    }
+
+    const providedBundle = preKeyBundles?.find((bundle) => bundle.deviceId() === retry.senderDeviceId);
+    const fetchedBundle = providedBundle ??
+      (await this.fetchPreKeyBundles({
+        destination,
+        ...(preKeyAuth !== undefined ? { preKeyAuth } : {}),
+        ...(abortSignal !== undefined ? { abortSignal } : {}),
+        device: { deviceId: retry.senderDeviceId },
+      })).find((bundle) => bundle.deviceId() === retry.senderDeviceId);
+    if (!fetchedBundle) {
+      throw new SignalTsStateError(
+        `Signal session is missing for retry receipt recipient ${destination.getServiceIdString()}.${retry.senderDeviceId}`,
+      );
+    }
+    this.logDebug(
+      `${traceId} retry-receipt session destination=${describeServiceId(destination)} senderDevice=${retry.senderDeviceId} registration=${fetchedBundle.registrationId()} source=prekey`,
+    );
+    return [
+      {
+        deviceId: retry.senderDeviceId,
+        registrationId: fetchedBundle.registrationId(),
+        contents: createSignalDecryptionErrorPlaintextContent(retry).asCiphertextMessage(),
+      },
+    ];
+  }
+
+  private buildRetryReceiptContentsFromPreKeyBundles({
+    retry,
+    preKeyBundles,
+  }: {
+    retry: SignalRetryReceiptRequest;
+    preKeyBundles: PreKeyBundle[];
+  }): Array<SendMessageRequest["contents"][number]> {
+    return preKeyBundles.map((bundle) => ({
+      deviceId: bundle.deviceId(),
+      registrationId: bundle.registrationId(),
+      contents: createSignalDecryptionErrorPlaintextContent(retry).asCiphertextMessage(),
+    }));
   }
 
   on<K extends SignalEventName>(event: K, handler: SignalEventHandler<K>): () => void {
@@ -833,38 +1100,16 @@ export class SignalTsClient {
       if (preKeyBundles.length === 0) {
         throw new SignalTsStateError("Signal recipient has no available prekey bundles");
       }
-      const localAddress = ProtocolAddress.new(
-        Aci.fromUuid(this.options.account.device.aci),
-        this.options.account.device.deviceId,
-      );
       const payload = encodeSignalContent(params.content);
       this.logDebug(`${traceId} content-send payload encoded bytes=${payload.byteLength}`);
-      const contents: Array<SendMessageRequest["contents"][number]> = [];
-      for (const bundle of preKeyBundles) {
-        const remoteAddress = ProtocolAddress.new(destination, bundle.deviceId());
-        const existingSession = await params.stores.sessionStore.getSession(remoteAddress);
-        this.logDebug(
-          `${traceId} content-send encrypt device=${bundle.deviceId()} registration=${bundle.registrationId()} existingSession=${existingSession ? "yes" : "no"}`,
-        );
-        const device = {
-          serviceId: destination,
-          deviceId: bundle.deviceId(),
-          registrationId: bundle.registrationId(),
-        };
-        if (!existingSession) {
-          Object.assign(device, { preKeyBundle: bundle });
-        }
-        const encrypted = await encryptPayloadForDevice({
-          localAddress,
-          device,
-          payload,
-          stores: params.stores,
-        });
-        this.logDebug(
-          `${traceId} content-send encrypted device=${encrypted.deviceId} registration=${encrypted.registrationId} ciphertextType=${encrypted.contents.type()}`,
-        );
-        contents.push(encrypted);
-      }
+      let contents = await this.buildDirectContentMessageContents({
+        traceId,
+        operation: "content-send",
+        destination,
+        payload,
+        stores: params.stores,
+        preKeyBundles,
+      });
       const sendParams: SendEncryptedMessageParams = {
         traceId,
         destination,
@@ -880,7 +1125,49 @@ export class SignalTsClient {
       if (params.abortSignal !== undefined) {
         sendParams.abortSignal = params.abortSignal;
       }
-      const result = await this.sendEncryptedMessage(sendParams);
+      let result: { timestamp: number };
+      try {
+        result = await this.sendEncryptedMessage(sendParams);
+      } catch (err) {
+        if (!isMismatchedDevicesError(err)) {
+          throw err;
+        }
+        const repair = await this.repairMismatchedDevices({
+          err,
+          traceId,
+          operation: "content-send",
+          destination,
+          stores: params.stores,
+        });
+        if (!repair) {
+          throw err;
+        }
+        const retryPreKeyBundles = await this.fetchPreKeyBundles({
+          destination,
+          ...(params.preKeyAuth !== undefined ? { preKeyAuth: params.preKeyAuth } : {}),
+          ...(params.abortSignal !== undefined ? { abortSignal: params.abortSignal } : {}),
+        });
+        this.logDebug(
+          `${traceId} content-send device-retry prekeys done destination=${describeServiceId(destination)} count=${retryPreKeyBundles.length} devices=${describePreKeyBundleDevices(retryPreKeyBundles)}`,
+        );
+        const refreshDeviceIds = repair.refreshAllDevices
+          ? new Set(retryPreKeyBundles.map((bundle) => bundle.deviceId()))
+          : repair.refreshDeviceIds;
+        contents = await this.buildDirectContentMessageContents({
+          traceId,
+          operation: "content-send:device-retry",
+          destination,
+          payload,
+          stores: params.stores,
+          preKeyBundles: retryPreKeyBundles,
+          refreshDeviceIds,
+        });
+        result = await this.sendEncryptedMessage({
+          ...sendParams,
+          traceId: `${traceId}:device-retry`,
+          contents,
+        });
+      }
       this.logInfo(
         `${traceId} content-send done destination=${describeServiceId(destination)} timestamp=${result.timestamp} devices=${describeOutboundDevices(contents)}`,
       );
@@ -915,33 +1202,59 @@ export class SignalTsClient {
         params.abortSignal,
         traceId,
       );
-      const remoteAddress = ProtocolAddress.new(destination, params.retry.senderDeviceId);
-      const session = await params.stores.sessionStore.getSession(remoteAddress);
-      if (!session) {
-        throw new SignalTsStateError(
-          `Signal session is missing for retry receipt recipient ${destination.getServiceIdString()}.${params.retry.senderDeviceId}`,
-        );
-      }
-      this.logDebug(
-        `${traceId} retry-receipt session destination=${describeServiceId(destination)} senderDevice=${params.retry.senderDeviceId} registration=${session.remoteRegistrationId()}`,
-      );
-      const result = await this.sendEncryptedMessage({
+      let contents = await this.buildRetryReceiptContentsForDevice({
+        traceId,
+        destination,
+        retry: params.retry,
+        stores: params.stores,
+        ...(params.preKeyBundles !== undefined ? { preKeyBundles: params.preKeyBundles } : {}),
+        ...(params.preKeyAuth !== undefined ? { preKeyAuth: params.preKeyAuth } : {}),
+        ...(params.abortSignal !== undefined ? { abortSignal: params.abortSignal } : {}),
+      });
+      const sendParams: SendEncryptedMessageParams = {
         traceId,
         destination,
         timestamp,
-        contents: [
-          {
-            deviceId: params.retry.senderDeviceId,
-            registrationId: session.remoteRegistrationId(),
-            contents: createSignalDecryptionErrorPlaintextContent(
-              params.retry,
-            ).asCiphertextMessage(),
-          },
-        ],
+        contents,
         ...(params.onlineOnly !== undefined ? { onlineOnly: params.onlineOnly } : {}),
         ...(params.urgent !== undefined ? { urgent: params.urgent } : {}),
         ...(params.abortSignal ? { abortSignal: params.abortSignal } : {}),
-      });
+      };
+      let result: { timestamp: number };
+      try {
+        result = await this.sendEncryptedMessage(sendParams);
+      } catch (err) {
+        if (!isMismatchedDevicesError(err)) {
+          throw err;
+        }
+        const repair = await this.repairMismatchedDevices({
+          err,
+          traceId,
+          operation: "retry-receipt",
+          destination,
+          stores: params.stores,
+        });
+        if (!repair) {
+          throw err;
+        }
+        const retryPreKeyBundles = await this.fetchPreKeyBundles({
+          destination,
+          ...(params.preKeyAuth !== undefined ? { preKeyAuth: params.preKeyAuth } : {}),
+          ...(params.abortSignal !== undefined ? { abortSignal: params.abortSignal } : {}),
+        });
+        this.logDebug(
+          `${traceId} retry-receipt device-retry prekeys done destination=${describeServiceId(destination)} count=${retryPreKeyBundles.length} devices=${describePreKeyBundleDevices(retryPreKeyBundles)}`,
+        );
+        contents = this.buildRetryReceiptContentsFromPreKeyBundles({
+          retry: params.retry,
+          preKeyBundles: retryPreKeyBundles,
+        });
+        result = await this.sendEncryptedMessage({
+          ...sendParams,
+          traceId: `${traceId}:device-retry`,
+          contents,
+        });
+      }
       this.logInfo(
         `${traceId} retry-receipt done destination=${describeServiceId(destination)} timestamp=${result.timestamp} failedTimestamp=${params.retry.timestamp}`,
       );
@@ -1498,12 +1811,17 @@ export class SignalTsClient {
     destination,
     preKeyAuth,
     abortSignal,
+    device,
   }: {
     destination: ServiceId;
     preKeyAuth?: PreKeyAuth;
     abortSignal?: AbortSignal;
+    device?: FetchPreKeysParams["device"];
   }): Promise<PreKeyBundle[]> {
     const fetchParams: FetchPreKeysParams = { target: destination };
+    if (device !== undefined) {
+      fetchParams.device = device;
+    }
     if (preKeyAuth !== undefined) {
       fetchParams.auth = preKeyAuth;
     }

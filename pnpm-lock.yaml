@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@signalapp/libsignal-client':
-        specifier: ^0.94.3
-        version: 0.94.3
+        specifier: ^0.96.4
+        version: 0.96.4
       protobufjs:
         specifier: ^8.5.0
         version: 8.5.0
@@ -173,8 +173,8 @@ packages:
   '@rolldown/pluginutils@1.0.1':
     resolution: {integrity: sha512-2j9bGt5Jh8hj+vPtgzPtl72j0yRxHAyumoo6TNfAjsLB04UtpSvPbPcDcBMxz7n+9CYB0c1GxQFxYRg2jimqGw==}
 
-  '@signalapp/libsignal-client@0.94.3':
-    resolution: {integrity: sha512-CeGLyteVvbUIrUc8lT5HfuY3elwawQuUA4ZOnObGd5uwXLHzM4yMQAt4OzeGT0D4hejaQgEDPIwHkZ9aeFwjOw==}
+  '@signalapp/libsignal-client@0.96.4':
+    resolution: {integrity: sha512-alldCRkl1uTt1RW1Aszrg0Dj4eWMCQvcAf6H7nIx5TFkM10m+pskQM+CgLa6ZbdHifIKEV9e/vAFFif8XxSWWA==}
 
   '@standard-schema/spec@1.1.0':
     resolution: {integrity: sha512-l2aFy5jALhniG5HgqrD6jXLi/rUWrKvqN/qJx6yoJsgKhblVd+iqqU4RCXavm/jPityDo5TCvKMnpjKnOriy0w==}
@@ -848,7 +848,7 @@ snapshots:
 
   '@rolldown/pluginutils@1.0.1': {}
 
-  '@signalapp/libsignal-client@0.94.3':
+  '@signalapp/libsignal-client@0.96.4':
     dependencies:
       node-gyp-build: 4.8.4
       type-fest: 4.41.0

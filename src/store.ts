@@ -41,6 +41,7 @@ export interface SignalRepository {
 
   getSession(address: string): Promise<SessionRecord | null>;
   saveSession(address: string, record: SessionRecord): Promise<void>;
+  removeSession(address: string): Promise<void>;
 
   getPreKey(id: number): Promise<PreKeyRecord | null>;
   savePreKey(id: number, record: PreKeyRecord): Promise<void>;
@@ -80,6 +81,10 @@ export class RepositorySessionStore extends SessionStore {
 
   async getSession(name: ProtocolAddress): Promise<SessionRecord | null> {
     return await this.repository.getSession(protocolAddressKey(name));
+  }
+
+  async removeSession(name: ProtocolAddress): Promise<void> {
+    await this.repository.removeSession(protocolAddressKey(name));
   }
 
   async getExistingSessions(addresses: ProtocolAddress[]): Promise<SessionRecord[]> {

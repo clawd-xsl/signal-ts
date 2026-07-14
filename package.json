@@ -19,7 +19,7 @@
     "check": "tsc -p tsconfig.json --noEmit && vitest run"
   },
   "dependencies": {
-    "@signalapp/libsignal-client": "^0.94.3",
+    "@signalapp/libsignal-client": "^0.96.4",
     "protobufjs": "^8.5.0",
     "undici": "8.0.2"
   },

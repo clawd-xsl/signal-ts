@@ -2,7 +2,9 @@ import { GroupMasterKey, GroupSecretParams } from "@signalapp/libsignal-client/d
 import { bytesToBase64, copyBytes, type Bytes } from "./bytes.js";
 import { decodeSignalDecryptionErrorMessage, type DecryptedIncomingMessage } from "./crypto.js";
 import {
+  decodeSignalCallMessage,
   requireEnvelopeSource,
+  type SignalCallMessage,
   type SignalContent,
   type SignalDataMessage,
   type SignalEnvelope,
@@ -78,6 +80,11 @@ export type SignalIncomingDecryptionErrorMessage = SignalIncomingBase & {
   };
 };
 
+export type SignalIncomingCallMessage = SignalIncomingBase & {
+  kind: "call";
+  call: SignalCallMessage; // precise bigint callIds
+};
+
 export type SignalIncomingUnknownMessage = SignalIncomingBase & {
   kind: "unknown";
   content: SignalContent;
@@ -91,6 +98,7 @@ export type SignalIncomingMessage =
   | SignalIncomingTypingMessage
   | SignalIncomingSyncMessage
   | SignalIncomingDecryptionErrorMessage
+  | SignalIncomingCallMessage
   | SignalIncomingUnknownMessage;
 
 export function normalizeDecryptedIncomingMessage(
@@ -99,16 +107,22 @@ export function normalizeDecryptedIncomingMessage(
   return normalizeSignalContent({
     envelope: message.envelope,
     content: message.content,
+    plaintext: message.plaintext,
   });
 }
 
 export function normalizeSignalContent({
   envelope,
   content,
+  plaintext,
   receivedAt,
 }: {
   envelope: SignalEnvelope;
   content: SignalContent;
+  // Raw decrypted Content bytes. Required to recover 64-bit-safe callIds via
+  // decodeSignalCallMessage; absent for callers that only have normalized content
+  // (those skip the kind:"call" branch and fall back to kind:"unknown").
+  plaintext?: Bytes;
   receivedAt?: number;
 }): SignalIncomingMessage[] {
   const baseParams: Parameters<typeof buildIncomingBase>[0] = { envelope };
@@ -176,6 +190,17 @@ export function normalizeSignalContent({
           : {}),
       },
     });
+  }
+  if (content.callMessage && plaintext) {
+    // CallMessage ids are random 64-bit; re-decode from raw bytes so callIds stay bigint.
+    const call = decodeSignalCallMessage(plaintext);
+    if (call) {
+      messages.push({
+        ...base,
+        kind: "call",
+        call,
+      });
+    }
   }
   if (messages.length === 0) {
     messages.push({

@@ -23,6 +23,9 @@
     "protobufjs": "^8.5.0",
     "undici": "8.0.2"
   },
+  "optionalDependencies": {
+    "@signalapp/ringrtc": "2.69.7"
+  },
   "devDependencies": {
     "@types/node": "^24.12.0",
     "protobufjs-cli": "^2.5.0",

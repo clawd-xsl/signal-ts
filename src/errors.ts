@@ -22,3 +22,10 @@ export class SignalTsStateError extends SignalTsError {
     this.name = "SignalTsStateError";
   }
 }
+
+export class SignalTsCallingUnavailableError extends SignalTsError {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, "calling-unavailable", options);
+    this.name = "SignalTsCallingUnavailableError";
+  }
+}

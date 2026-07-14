@@ -1,6 +1,7 @@
 export * from "./attachments.js";
 export * from "./account.js";
 export * from "./bytes.js";
+export * from "./calling/index.js";
 export * from "./certificates.js";
 export * from "./client.js";
 export * from "./crypto.js";

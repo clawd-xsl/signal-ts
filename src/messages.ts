@@ -123,6 +123,21 @@ export type SignalTypingMessage = {
   groupId?: Bytes;
 };
 
+export type SignalCallMessage = {
+  offer?: { callId: bigint; type: "audio" | "video"; opaque: Bytes };
+  answer?: { callId: bigint; opaque: Bytes };
+  // RingRTC "iceCandidates" maps to the Signal wire field "iceUpdate".
+  iceUpdate?: Array<{ callId: bigint; opaque: Bytes }>;
+  busy?: { callId: bigint };
+  hangup?: {
+    callId: bigint;
+    type: "normal" | "accepted" | "declined" | "busy" | "need-permission";
+    deviceId: number;
+  };
+  opaque?: { data: Bytes; urgency?: "droppable" | "handle-immediately" };
+  destinationDeviceId?: number;
+};
+
 export type SignalContent = {
   dataMessage?: SignalDataMessage;
   syncMessage?: Record<string, unknown>;
@@ -283,6 +298,220 @@ export function createReceiptSignalContent(receipt: SignalReceiptMessage): Signa
 
 export function createTypingSignalContent(typing: SignalTypingMessage): SignalContent {
   return { typingMessage: typing };
+}
+
+/**
+ * Builds SignalContent.callMessage matching SignalService.proto CallMessage (proto:123-186).
+ * callId -> proto uint64 `id`. protobufjs's reflection verifier rejects plain strings for 64-bit
+ * fields (it demands integer|Long), so ids are carried as a Long-compatible {low,high,unsigned}
+ * pair derived from the bigint — 64-bit-safe with no precision loss. Enum maps: Offer.type
+ * audio=0/video=1; Hangup.type normal=0..need-permission=4; Opaque.urgency droppable=0/handle-
+ * immediately=1. RingRTC "iceCandidates" maps onto the Signal wire field "iceUpdate".
+ */
+export function createCallSignalContent(message: SignalCallMessage): SignalContent {
+  const callMessage: Record<string, unknown> = {};
+  if (message.offer) {
+    callMessage["offer"] = {
+      id: callIdToProtoLong(message.offer.callId),
+      type: offerTypeToProto(message.offer.type),
+      opaque: message.offer.opaque,
+    };
+  }
+  if (message.answer) {
+    callMessage["answer"] = {
+      id: callIdToProtoLong(message.answer.callId),
+      opaque: message.answer.opaque,
+    };
+  }
+  if (message.iceUpdate && message.iceUpdate.length > 0) {
+    callMessage["iceUpdate"] = message.iceUpdate.map((candidate) => ({
+      id: callIdToProtoLong(candidate.callId),
+      opaque: candidate.opaque,
+    }));
+  }
+  if (message.busy) {
+    callMessage["busy"] = { id: callIdToProtoLong(message.busy.callId) };
+  }
+  if (message.hangup) {
+    callMessage["hangup"] = {
+      id: callIdToProtoLong(message.hangup.callId),
+      type: hangupTypeToProto(message.hangup.type),
+      deviceId: message.hangup.deviceId,
+    };
+  }
+  if (message.opaque) {
+    const opaque: Record<string, unknown> = { data: message.opaque.data };
+    if (message.opaque.urgency !== undefined) {
+      opaque["urgency"] = urgencyToProto(message.opaque.urgency);
+    }
+    callMessage["opaque"] = opaque;
+  }
+  if (message.destinationDeviceId !== undefined) {
+    callMessage["destinationDeviceId"] = message.destinationDeviceId;
+  }
+  return { callMessage };
+}
+
+/**
+ * Re-decodes the raw decrypted Content bytes with longs:String and returns precise bigint ids.
+ * The normal decodeProto path uses longs:Number, which silently truncates the random 64-bit call
+ * ids RingRTC assigns (routinely > 2^53); reading ids anywhere else would corrupt them.
+ * Returns undefined when the Content carries no callMessage.
+ */
+export function decodeSignalCallMessage(contentBytes: Bytes): SignalCallMessage | undefined {
+  const raw = contentType.toObject(contentType.decode(contentBytes), {
+    bytes: Uint8Array,
+    defaults: false,
+    enums: Number,
+    // String (not Number): keep 64-bit call ids exact so BigInt() recovers them losslessly.
+    longs: String,
+    objects: false,
+    oneofs: false,
+  }) as Record<string, unknown>;
+  const callMessage = optionalRecord(raw["callMessage"]);
+  if (!callMessage) {
+    return undefined;
+  }
+
+  const message: SignalCallMessage = {};
+  const offer = optionalRecord(callMessage["offer"]);
+  if (offer) {
+    message.offer = {
+      callId: protoIdToCallId(offer["id"]),
+      type: offerTypeFromProto(offer["type"]),
+      opaque: optionalOpaque(offer["opaque"]),
+    };
+  }
+  const answer = optionalRecord(callMessage["answer"]);
+  if (answer) {
+    message.answer = {
+      callId: protoIdToCallId(answer["id"]),
+      opaque: optionalOpaque(answer["opaque"]),
+    };
+  }
+  const iceUpdate = optionalArray(callMessage["iceUpdate"]);
+  if (iceUpdate) {
+    const candidates: NonNullable<SignalCallMessage["iceUpdate"]> = [];
+    for (const entry of iceUpdate) {
+      const record = optionalRecord(entry);
+      if (record) {
+        candidates.push({
+          callId: protoIdToCallId(record["id"]),
+          opaque: optionalOpaque(record["opaque"]),
+        });
+      }
+    }
+    if (candidates.length > 0) {
+      message.iceUpdate = candidates;
+    }
+  }
+  const busy = optionalRecord(callMessage["busy"]);
+  if (busy) {
+    message.busy = { callId: protoIdToCallId(busy["id"]) };
+  }
+  const hangup = optionalRecord(callMessage["hangup"]);
+  if (hangup) {
+    message.hangup = {
+      callId: protoIdToCallId(hangup["id"]),
+      type: hangupTypeFromProto(hangup["type"]),
+      deviceId: optionalNumber(hangup["deviceId"]) ?? 0,
+    };
+  }
+  const opaque = optionalRecord(callMessage["opaque"]);
+  if (opaque) {
+    const decoded: NonNullable<SignalCallMessage["opaque"]> = { data: optionalOpaque(opaque["data"]) };
+    const urgency = urgencyFromProto(opaque["urgency"]);
+    if (urgency !== undefined) {
+      decoded.urgency = urgency;
+    }
+    message.opaque = decoded;
+  }
+  const destinationDeviceId = optionalNumber(callMessage["destinationDeviceId"]);
+  if (destinationDeviceId !== undefined) {
+    message.destinationDeviceId = destinationDeviceId;
+  }
+  return message;
+}
+
+// A 64-bit call id as a Long-compatible pair. protobufjs's writer (LongBits.from) and reflection
+// verifier both accept this shape, unlike a decimal string which the verifier rejects.
+function callIdToProtoLong(callId: bigint): { low: number; high: number; unsigned: true } {
+  const unsigned = BigInt.asUintN(64, callId);
+  return {
+    low: Number(unsigned & 0xffffffffn) | 0,
+    high: Number((unsigned >> 32n) & 0xffffffffn) | 0,
+    unsigned: true,
+  };
+}
+
+function protoIdToCallId(value: unknown): bigint {
+  if (typeof value === "string" && value.length > 0) {
+    return BigInt(value);
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return BigInt(value);
+  }
+  return 0n;
+}
+
+// opaque/data are `bytes` fields required by SignalCallMessage; a well-formed CallMessage always
+// carries them. Copy out of the decode buffer, defaulting to empty for degenerate inputs.
+function optionalOpaque(value: unknown): Bytes {
+  return value instanceof Uint8Array ? copyBytes(value) : copyBytes(new Uint8Array(0));
+}
+
+function offerTypeToProto(type: NonNullable<SignalCallMessage["offer"]>["type"]): number {
+  return type === "video" ? 1 : 0;
+}
+
+function offerTypeFromProto(value: unknown): NonNullable<SignalCallMessage["offer"]>["type"] {
+  return value === 1 ? "video" : "audio";
+}
+
+function hangupTypeToProto(type: NonNullable<SignalCallMessage["hangup"]>["type"]): number {
+  switch (type) {
+    case "accepted":
+      return 1;
+    case "declined":
+      return 2;
+    case "busy":
+      return 3;
+    case "need-permission":
+      return 4;
+    default:
+      return 0;
+  }
+}
+
+function hangupTypeFromProto(value: unknown): NonNullable<SignalCallMessage["hangup"]>["type"] {
+  switch (value) {
+    case 1:
+      return "accepted";
+    case 2:
+      return "declined";
+    case 3:
+      return "busy";
+    case 4:
+      return "need-permission";
+    default:
+      return "normal";
+  }
+}
+
+function urgencyToProto(
+  urgency: NonNullable<NonNullable<SignalCallMessage["opaque"]>["urgency"]>,
+): number {
+  return urgency === "handle-immediately" ? 1 : 0;
+}
+
+function urgencyFromProto(value: unknown): NonNullable<SignalCallMessage["opaque"]>["urgency"] {
+  if (value === 1) {
+    return "handle-immediately";
+  }
+  if (value === 0) {
+    return "droppable";
+  }
+  return undefined;
 }
 
 export function requireEnvelopeSource(envelope: SignalEnvelope): {

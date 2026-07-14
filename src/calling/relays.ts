@@ -1,4 +1,4 @@
-// TURN relay fetch for calling. Runs GET /v1/calling/relays over the caller's
+// TURN relay fetch for calling. Runs GET /v2/calling/relays over the caller's
 // EXISTING authenticated chat connection (the monitor's live client). Signal
 // permits only one authenticated socket per device, so opening a second
 // connection here would trigger a server-side ConnectedElsewhere that
@@ -21,10 +21,11 @@ export type FetchTurnServersParams = {
 
 // Authenticated calling-relays endpoint. Response carries the short-lived ICE
 // server groups (STUN/TURN creds) RingRTC needs to negotiate the peer connection.
-const CALLING_RELAYS_PATH = "/v1/calling/relays";
+// v2 is the current endpoint (Android/Desktop/iOS); v1 returns HTTP 404.
+const CALLING_RELAYS_PATH = "/v2/calling/relays";
 
 /**
- * GET /v1/calling/relays. Parses `{ relays: [{ username, password, urls, urlsWithIps?, hostname? }] }`
+ * GET /v2/calling/relays. Parses `{ relays: [{ username, password, urls, urlsWithIps?, hostname? }] }`
  * (and tolerates a legacy flat single-relay object) into TurnServer[]. Throws
  * SignalTsStateError on non-2xx, missing/malformed body, or an empty server set.
  * Result is short-lived; the caller (manager) fetches once per call and does not cache.

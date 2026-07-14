@@ -371,6 +371,9 @@ export class SignalCallManager {
       await this.beginCallMedia(active);
       return true;
     } catch (err) {
+      // Media bring-up (TURN fetch, audio devices, proceed) is where a call
+      // silently dies; log the raw cause so it is not lost behind the event.
+      this.deps.logger?.error?.("signal-call media bring-up failed", toError(err));
       this.emitError(active.callId, toError(err));
       this.finalizeCall(active, "internal-failure");
       return false;

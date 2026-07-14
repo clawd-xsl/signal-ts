@@ -65,6 +65,11 @@ async function loadRingRtcModule(): Promise<RingRtcModuleExports> {
 }
 
 const DEFAULT_OUTGOING_RING_TIMEOUT_MS = 60_000;
+// RingRTC honors AcceptCall only in ConnectedBeforeAccepted (public state
+// "ringing"); accept() waits for that transition. ICE normally connects within
+// seconds and a call that never connects ends through its own failure path, so
+// this cap only guards against a wedged native state machine.
+const ACCEPT_RINGING_WAIT_MS = 30_000;
 // RingRTC's getAudioInputs/Outputs return a cached device list refreshed
 // asynchronously (cubeb device-changed callback) after pactl creates the virtual
 // modules, so the freshly loaded sink/source may not be visible immediately.
@@ -250,8 +255,61 @@ export class SignalCallManager {
       this.deps.logger?.warn?.(`signal-call accept: no active call matching ${callId}`);
       return;
     }
+    await this.waitUntilAcceptable(active);
     // Media bring-up already ran in handleStartCall; accept just tells RingRTC to answer.
     this.requireModule().RingRTC.accept(callId);
+  }
+
+  // RingRTC accepts locally only in state "ringing" (ConnectedBeforeAccepted:
+  // ICE connected, not yet accepted). Accepting earlier is NOT an error on the
+  // native side — it logs "Unexpected event AcceptCall", drops the request, and
+  // the call wedges in connecting until a timeout. Wait for the ringing
+  // transition; fail if the call ends first so callers see a real error.
+  private async waitUntilAcceptable(active: ActiveCall): Promise<void> {
+    if (active.lastState === "ringing" || active.lastState === "connected") {
+      return;
+    }
+    if (active.ended || active.lastState === "ended") {
+      throw new SignalTsStateError("Signal call ended before it could be accepted");
+    }
+    await new Promise<void>((resolve, reject) => {
+      let off = (): void => {};
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const settle = (fn: () => void): void => {
+        off();
+        if (timer !== undefined) {
+          clearTimeout(timer);
+        }
+        fn();
+      };
+      const endedError = (): Error =>
+        new SignalTsStateError("Signal call ended before it could be accepted");
+      off = this.on((event) => {
+        if (event.type === "state" && event.callId === active.callId) {
+          if (event.state === "ringing" || event.state === "connected") {
+            settle(resolve);
+          } else if (event.state === "ended") {
+            settle(() => reject(endedError()));
+          }
+        } else if (event.type === "ended" && event.callId === active.callId) {
+          settle(() => reject(endedError()));
+        } else if (
+          event.type === "error" &&
+          (event.callId === undefined || event.callId === active.callId)
+        ) {
+          settle(() => reject(event.error));
+        }
+      });
+      timer = setTimeout(() => {
+        settle(() =>
+          reject(
+            new SignalTsStateError(
+              `Signal call never became acceptable (no ICE connection within ${ACCEPT_RINGING_WAIT_MS}ms)`,
+            ),
+          ),
+        );
+      }, ACCEPT_RINGING_WAIT_MS);
+    });
   }
 
   async decline(callId: CallId): Promise<void> {

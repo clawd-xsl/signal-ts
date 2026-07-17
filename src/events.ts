@@ -10,6 +10,7 @@ export type SignalClientEventMap = {
   incoming: SignalIncomingEnvelope;
   queueEmpty: void;
   disconnected: Error | null;
+  connected: void;
 };
 
 export type SignalEventName = keyof SignalClientEventMap;

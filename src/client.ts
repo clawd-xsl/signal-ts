@@ -127,6 +127,10 @@ export type SignalTsClientOptions = {
   connectionFactory?: SignalConnectionFactory;
   sealedSenderConnectionFactory?: SignalSealedSenderConnectionFactory;
   targetResolver?: SignalTargetResolver;
+  /** App-level keepalive interval; 0 disables. Default 30s (Signal-Desktop parity). */
+  keepaliveIntervalMs?: number;
+  /** Per-keepalive timeout before the delivery socket is treated as dead. Default 20s. */
+  keepaliveTimeoutMs?: number;
 };
 
 export type SendEncryptedMessageParams = {
@@ -295,6 +299,14 @@ export type UploadAttachmentParams = {
 };
 
 const DEFAULT_USER_AGENT = "OpenClaw signal-ts/0.0.0";
+// App-level keepalive. libsignal's own WebSocket ping/pong keeps the socket
+// alive at the transport layer, but the server can silently stop delivering
+// over an otherwise-ESTABLISHED socket; only an application-level round trip
+// (Signal-Desktop/signal-cli GET /v1/keepalive) detects that. On failure the
+// delivery socket is dead and we force a reconnect.
+const DEFAULT_KEEPALIVE_INTERVAL_MS = 30_000;
+const DEFAULT_KEEPALIVE_TIMEOUT_MS = 20_000;
+const KEEPALIVE_PATH = "/v1/keepalive";
 const SIGNAL_LONG_TEXT_CONTENT_TYPE = "text/x-signal-plain";
 const SIGNAL_MESSAGE_BODY_MAX_BYTES = 2000;
 
@@ -554,6 +566,11 @@ export class SignalTsClient {
   private signalStateMutationQueue: Promise<void> = Promise.resolve();
   private net: Net.Net | undefined;
   private connection: SignalChatConnection | undefined;
+  private keepaliveTimer: ReturnType<typeof setInterval> | undefined;
+  private keepaliveInFlight = false;
+  // Last time the server proved this connection alive (a delivered envelope or
+  // a successful keepalive). Consumed by the host for stale-socket health.
+  private lastTransportActivityAt: number | undefined;
 
   constructor(private readonly options: SignalTsClientOptions) {
     this.logger = options.logger;
@@ -857,13 +874,93 @@ export class SignalTsClient {
         ...(abortSignal ? { abortSignal } : {}),
       });
       this.logInfo(`connected to Signal chat (${this.connection.connectionInfo().toString()})`);
+      this.lastTransportActivityAt = Date.now();
+      this.startKeepalive();
+      this.events.emit("connected", undefined);
     } catch (err) {
       this.logError("connect failed", err);
       throw err;
     }
   }
 
+  /** Last time the server proved this connection alive (delivery or keepalive). */
+  getLastTransportActivityAt(): number | undefined {
+    return this.lastTransportActivityAt;
+  }
+
+  private startKeepalive(): void {
+    this.stopKeepalive();
+    const intervalMs = this.options.keepaliveIntervalMs ?? DEFAULT_KEEPALIVE_INTERVAL_MS;
+    if (intervalMs <= 0) {
+      return;
+    }
+    this.keepaliveTimer = setInterval(() => {
+      void this.runKeepaliveTick();
+    }, intervalMs);
+    // Node timers keep the event loop alive; this one should not on its own.
+    this.keepaliveTimer.unref?.();
+  }
+
+  private stopKeepalive(): void {
+    if (this.keepaliveTimer) {
+      clearInterval(this.keepaliveTimer);
+      this.keepaliveTimer = undefined;
+    }
+    this.keepaliveInFlight = false;
+  }
+
+  private async runKeepaliveTick(): Promise<void> {
+    if (this.keepaliveInFlight) {
+      return;
+    }
+    const connection = this.connection;
+    if (!connection?.fetch) {
+      return;
+    }
+    this.keepaliveInFlight = true;
+    const timeoutMs = this.options.keepaliveTimeoutMs ?? DEFAULT_KEEPALIVE_TIMEOUT_MS;
+    const traceId = createSignalTraceId("keepalive");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const response = await Promise.race([
+        connection.fetch({ verb: "GET", path: KEEPALIVE_PATH, headers: [], timeoutMillis: timeoutMs }),
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(
+            () => reject(new SignalTsStateError(`keepalive timed out after ${timeoutMs}ms`)),
+            timeoutMs,
+          );
+        }),
+      ]);
+      if (response.status < 200 || response.status >= 300) {
+        throw new SignalTsStateError(`keepalive returned HTTP ${response.status}`);
+      }
+      this.lastTransportActivityAt = Date.now();
+      this.logDebug(`${traceId} keepalive ok status=${response.status}`);
+    } catch (err) {
+      // The delivery socket is dead even if TCP is still ESTABLISHED. Tear it
+      // down and surface a disconnect so the monitor reconnects.
+      this.logWarn(`${traceId} keepalive failed; forcing reconnect: ${describeSignalError(err)}`);
+      this.handleDeadConnection(err instanceof Error ? err : new Error(String(err)));
+    } finally {
+      if (timer) {
+        clearTimeout(timer);
+      }
+      this.keepaliveInFlight = false;
+    }
+  }
+
+  private handleDeadConnection(cause: Error): void {
+    this.stopKeepalive();
+    const connection = this.connection;
+    this.connection = undefined;
+    if (connection) {
+      void connection.disconnect().catch(() => undefined);
+    }
+    this.events.emit("disconnected", cause);
+  }
+
   async disconnect(): Promise<void> {
+    this.stopKeepalive();
     const connection = this.connection;
     this.connection = undefined;
     if (connection) {
@@ -1947,10 +2044,13 @@ export class SignalTsClient {
         this.logWarn(
           `Signal chat connection interrupted: ${cause ? describeSignalError(cause) : "null"}`,
         );
+        this.stopKeepalive();
         this.events.emit("disconnected", cause);
       },
       onIncomingMessage: (envelope, timestamp, ack) => {
         const traceId = createSignalTraceId("incoming");
+        // A delivered envelope proves the socket is live.
+        this.lastTransportActivityAt = Date.now();
         this.logInfo(`${traceId} incoming envelope ${describeIncomingEnvelope(envelope, timestamp)}`);
         this.events.emit("incoming", {
           envelope,

@@ -584,4 +584,74 @@ describe("SignalTsClient", () => {
       revision: 7,
     });
   });
+
+  describe("app-level keepalive", () => {
+    const account = {
+      auth: { username: "user.1", password: "pass" },
+      device: {
+        aci: "11111111-1111-4111-8111-111111111111",
+        deviceId: 1,
+        registrationId: 42,
+      },
+    } as const;
+
+    it("marks transport activity on a successful keepalive", async () => {
+      vi.useFakeTimers();
+      try {
+        const fetch = vi.fn(async () => ({ status: 200, message: "", headers: [], body: undefined }));
+        const connection: SignalChatConnection = {
+          sendMessage: vi.fn(async () => {}),
+          sendSyncMessage: vi.fn(async () => {}),
+          disconnect: vi.fn(async () => {}),
+          connectionInfo: () => ({ localPort: 1, ipVersion: "IPv4", toString: () => "fake" }),
+          fetch,
+        };
+        const client = new SignalTsClient({
+          account,
+          connectionFactory: async () => connection,
+          keepaliveIntervalMs: 1_000,
+          keepaliveTimeoutMs: 500,
+        });
+        await client.connect();
+        const before = client.getLastTransportActivityAt();
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(fetch).toHaveBeenCalledWith(
+          expect.objectContaining({ verb: "GET", path: "/v1/keepalive" }),
+        );
+        expect(client.getLastTransportActivityAt()).toBeGreaterThanOrEqual(before ?? 0);
+        await client.disconnect();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("emits disconnected and tears down the socket when keepalive fails", async () => {
+      vi.useFakeTimers();
+      try {
+        const disconnect = vi.fn(async () => {});
+        const connection: SignalChatConnection = {
+          sendMessage: vi.fn(async () => {}),
+          sendSyncMessage: vi.fn(async () => {}),
+          disconnect,
+          connectionInfo: () => ({ localPort: 1, ipVersion: "IPv4", toString: () => "fake" }),
+          fetch: vi.fn(async () => ({ status: 500, message: "", headers: [], body: undefined })),
+        };
+        const client = new SignalTsClient({
+          account,
+          connectionFactory: async () => connection,
+          keepaliveIntervalMs: 1_000,
+          keepaliveTimeoutMs: 500,
+        });
+        const onDisconnected = vi.fn();
+        client.on("disconnected", onDisconnected);
+        await client.connect();
+        await vi.advanceTimersByTimeAsync(1_000);
+        expect(onDisconnected).toHaveBeenCalledTimes(1);
+        expect(disconnect).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
 });

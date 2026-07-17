@@ -34,8 +34,11 @@ import {
 import { bytesToHex, utf8Bytes } from "./bytes.js";
 import {
   createSignalDecryptionErrorPlaintextContent,
+  decryptIncomingEnvelope,
   encryptPayloadForDevice,
   padSignalMessageBody,
+  type DecryptedIncomingMessage,
+  type DecryptIncomingEnvelopeParams,
   type SignalRetryReceiptRequest,
 } from "./crypto.js";
 import { SignalEventHub } from "./events.js";
@@ -1073,6 +1076,48 @@ export class SignalTsClient {
     const traceId = params.traceId ?? createSignalTraceId("content");
     return await this.runSerializedSignalStateMutation(traceId, "content-send", async () =>
       await this.sendContentMessageUnlocked({ ...params, traceId }),
+    );
+  }
+
+  /**
+   * Decrypts one inbound envelope under the same session-state lock as outbound
+   * encryption. libsignal sessions are not safe for concurrent mutation, so
+   * running decryption off this lock races the outbound ratchet (e.g. a typing
+   * send) and corrupts the session, after which the peer can no longer decrypt
+   * our messages. Callers MUST use this instead of the standalone
+   * decryptIncomingEnvelope for any session that also sends.
+   */
+  async decryptIncoming(
+    params: DecryptIncomingEnvelopeParams & { traceId?: string },
+  ): Promise<DecryptedIncomingMessage> {
+    const traceId = params.traceId ?? createSignalTraceId("incoming-decrypt");
+    return await this.runSerializedSignalStateMutation(traceId, "incoming-decrypt", async () =>
+      decryptIncomingEnvelope(params),
+    );
+  }
+
+  /**
+   * Archives our session with one peer device so the next outbound message
+   * re-establishes a fresh session via a prekey handshake. Called when the peer
+   * reports it could not decrypt one of our messages (a DecryptionErrorMessage /
+   * retry request): the ratchet has diverged, and only a new session recovers
+   * it — otherwise the peer keeps showing "message couldn't be delivered".
+   */
+  async archiveSessionForPeer(params: {
+    serviceId: string;
+    deviceId: number;
+    stores: Pick<LibsignalStores, "sessionStore">;
+    traceId?: string;
+  }): Promise<void> {
+    const traceId = params.traceId ?? createSignalTraceId("session-archive");
+    await this.runSerializedSignalStateMutation(traceId, "session-archive", async () =>
+      this.removeRecipientSessionDevice({
+        traceId,
+        operation: "session-archive",
+        destination: Aci.fromUuid(params.serviceId),
+        deviceId: params.deviceId,
+        sessionStore: params.stores.sessionStore,
+      }),
     );
   }
 

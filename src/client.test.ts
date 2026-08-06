@@ -157,7 +157,8 @@ describe("SignalTsClient", () => {
     const firstCanFinish = new Promise<void>((resolve) => {
       releaseFirst = resolve;
     });
-    const sendContentMessageUnlocked = vi.fn(
+    const fetchPreKeyBundles = vi.fn(async () => [createFakePreKeyBundle(1, 42)]);
+    const sendContentMessageLocked = vi.fn(
       async (params: SendContentMessageParams): Promise<{ timestamp: number }> => {
         events.push(`${params.traceId}:start`);
         if (params.traceId === "first") {
@@ -168,11 +169,12 @@ describe("SignalTsClient", () => {
         return { timestamp: params.timestamp ?? 0 };
       },
     );
-    (
-      client as unknown as {
-        sendContentMessageUnlocked: typeof sendContentMessageUnlocked;
-      }
-    ).sendContentMessageUnlocked = sendContentMessageUnlocked;
+    const clientInternals = client as unknown as {
+      fetchPreKeyBundles: typeof fetchPreKeyBundles;
+      sendContentMessageLocked: typeof sendContentMessageLocked;
+    };
+    clientInternals.fetchPreKeyBundles = fetchPreKeyBundles;
+    clientInternals.sendContentMessageLocked = sendContentMessageLocked;
 
     const first = client.sendContentMessage(createContentParams("first", 1));
     await firstStarted;
@@ -187,6 +189,110 @@ describe("SignalTsClient", () => {
       { timestamp: 2 },
     ]);
     expect(events).toEqual(["first:start", "first:end", "second:start", "second:end"]);
+  });
+
+  it("fetches prekeys outside the state lock so a stalled fetch cannot starve it", async () => {
+    const client = createTestClient();
+    let releaseFetch!: () => void;
+    const fetchGate = new Promise<PreKeyBundle[]>((resolve) => {
+      releaseFetch = () => resolve([createFakePreKeyBundle(1, 42)]);
+    });
+    const fetchPreKeyBundles = vi.fn(async () => await fetchGate);
+    const sendContentMessageLocked = vi.fn(
+      async (params: SendContentMessageParams): Promise<{ timestamp: number }> => ({
+        timestamp: params.timestamp ?? 0,
+      }),
+    );
+    const clientInternals = client as unknown as {
+      fetchPreKeyBundles: typeof fetchPreKeyBundles;
+      sendContentMessageLocked: typeof sendContentMessageLocked;
+    };
+    clientInternals.fetchPreKeyBundles = fetchPreKeyBundles;
+    clientInternals.sendContentMessageLocked = sendContentMessageLocked;
+
+    // Cold send: its prekey fetch stalls, but it stalls before taking the lock.
+    const stalled = client.sendContentMessage(createContentParams("stalled-cold", 1));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(fetchPreKeyBundles).toHaveBeenCalledTimes(1);
+    expect(sendContentMessageLocked).not.toHaveBeenCalled();
+
+    // A warm send acquires the lock and completes while the fetch hangs.
+    const warmParams = {
+      ...createContentParams("warm", 2),
+      stores: {
+        sessionStore: { listDeviceIds: async () => [1] },
+      } as unknown as SendContentMessageParams["stores"],
+    };
+    await expect(client.sendContentMessage(warmParams)).resolves.toEqual({ timestamp: 2 });
+
+    releaseFetch();
+    await expect(stalled).resolves.toEqual({ timestamp: 1 });
+  });
+
+  it("skips the prekey fetch when sessions already exist for the destination", async () => {
+    const client = createTestClient();
+    const fetchPreKeyBundles = vi.fn(async () => [createFakePreKeyBundle(1, 42)]);
+    const sendContentMessageLocked = vi.fn(
+      async (
+        params: SendContentMessageParams & { preKeyBundles?: unknown },
+      ): Promise<{ timestamp: number }> => ({ timestamp: params.timestamp ?? 0 }),
+    );
+    const clientInternals = client as unknown as {
+      fetchPreKeyBundles: typeof fetchPreKeyBundles;
+      sendContentMessageLocked: typeof sendContentMessageLocked;
+    };
+    clientInternals.fetchPreKeyBundles = fetchPreKeyBundles;
+    clientInternals.sendContentMessageLocked = sendContentMessageLocked;
+
+    const warmParams = {
+      ...createContentParams("warm-skip", 7),
+      stores: {
+        sessionStore: { listDeviceIds: async () => [1, 2] },
+      } as unknown as SendContentMessageParams["stores"],
+    };
+    await expect(client.sendContentMessage(warmParams)).resolves.toEqual({ timestamp: 7 });
+
+    expect(fetchPreKeyBundles).not.toHaveBeenCalled();
+    expect(sendContentMessageLocked.mock.calls[0]?.[0]?.preKeyBundles).toBeUndefined();
+  });
+
+  it("drops queued sends whose abort deadline passed while waiting for the lock", async () => {
+    const client = createTestClient();
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const fetchPreKeyBundles = vi.fn(async () => [createFakePreKeyBundle(1, 42)]);
+    const sendContentMessageLocked = vi.fn(
+      async (params: SendContentMessageParams): Promise<{ timestamp: number }> => {
+        if (params.traceId === "holder") {
+          await firstGate;
+        }
+        return { timestamp: params.timestamp ?? 0 };
+      },
+    );
+    const clientInternals = client as unknown as {
+      fetchPreKeyBundles: typeof fetchPreKeyBundles;
+      sendContentMessageLocked: typeof sendContentMessageLocked;
+    };
+    clientInternals.fetchPreKeyBundles = fetchPreKeyBundles;
+    clientInternals.sendContentMessageLocked = sendContentMessageLocked;
+
+    const holder = client.sendContentMessage(createContentParams("holder", 1));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const abort = new AbortController();
+    const queued = client.sendContentMessage({
+      ...createContentParams("expired", 2),
+      abortSignal: abort.signal,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    abort.abort();
+
+    releaseFirst();
+    await expect(holder).resolves.toEqual({ timestamp: 1 });
+    await expect(queued).rejects.toMatchObject({ name: "AbortError" });
+    expect(sendContentMessageLocked).toHaveBeenCalledTimes(1);
   });
 
   it("connects through the injected connection factory and sends encrypted payloads", async () => {
@@ -534,6 +640,55 @@ describe("SignalTsClient", () => {
       }),
       existingAttachment,
     ]);
+  });
+
+  it("fetches group member prekeys only for members without sessions", async () => {
+    const client = createTestClient();
+    const warm = "22222222-2222-4222-8222-222222222222";
+    const cold = "33333333-3333-4333-8333-333333333333";
+    const fetchPreKeyBundlesForGroupMember = vi.fn(
+      async (_params: { destination: { getServiceIdString(): string } }) => [
+        createFakePreKeyBundle(1, 42),
+      ],
+    );
+    const sendGroupContentMessageLocked = vi.fn(
+      async (params: {
+        timestamp: number;
+        recipients: unknown[];
+        memberBundles: Map<string, unknown>;
+      }) => ({ timestamp: params.timestamp, recipients: params.recipients.length }),
+    );
+    const clientInternals = client as unknown as {
+      fetchPreKeyBundlesForGroupMember: typeof fetchPreKeyBundlesForGroupMember;
+      sendGroupContentMessageLocked: typeof sendGroupContentMessageLocked;
+    };
+    clientInternals.fetchPreKeyBundlesForGroupMember = fetchPreKeyBundlesForGroupMember;
+    clientInternals.sendGroupContentMessageLocked = sendGroupContentMessageLocked;
+
+    await client.sendGroupMessage({
+      traceId: "group-warm-cold",
+      members: [Aci.fromUuid(warm), Aci.fromUuid(cold)],
+      group: {
+        masterKey: new Uint8Array(32),
+        revision: 7,
+        distributionId: "33333333-3333-4333-8333-333333333333",
+      },
+      body: "hello",
+      timestamp: 456,
+      stores: {
+        sessionStore: {
+          listDeviceIds: async (serviceId: string) => (serviceId === warm ? [1, 2] : []),
+        },
+      } as unknown as Parameters<SignalTsClient["sendGroupMessage"]>[0]["stores"],
+    });
+
+    expect(fetchPreKeyBundlesForGroupMember).toHaveBeenCalledTimes(1);
+    expect(
+      fetchPreKeyBundlesForGroupMember.mock.calls[0]?.[0].destination.getServiceIdString(),
+    ).toBe(cold);
+    const lockedParams = sendGroupContentMessageLocked.mock.calls[0]?.[0];
+    expect(lockedParams?.memberBundles.has(cold)).toBe(true);
+    expect(lockedParams?.memberBundles.has(warm)).toBe(false);
   });
 
   it("sends oversized group text as a Signal long-text attachment", async () => {

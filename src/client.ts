@@ -605,6 +605,7 @@ export class SignalTsClient {
   private async runSerializedSignalStateMutation<T>(
     traceId: string,
     operation: string,
+    abortSignal: AbortSignal | undefined,
     run: () => Promise<T>,
   ): Promise<T> {
     const previous = this.signalStateMutationQueue;
@@ -620,6 +621,10 @@ export class SignalTsClient {
       this.logDebug(`${traceId} ${operation} state-lock acquired waitMs=${waitMs}`);
     }
     try {
+      // A queued operation can outlive its caller's deadline while a stalled
+      // predecessor holds the lock; running it anyway spends lock time on a
+      // result nobody consumes and delays every operation behind it.
+      abortSignal?.throwIfAborted();
       return await run();
     } finally {
       release();
@@ -1171,9 +1176,91 @@ export class SignalTsClient {
 
   async sendContentMessage(params: SendContentMessageParams): Promise<{ timestamp: number }> {
     const traceId = params.traceId ?? createSignalTraceId("content");
-    return await this.runSerializedSignalStateMutation(traceId, "content-send", async () =>
-      await this.sendContentMessageUnlocked({ ...params, traceId }),
+    const timestamp = params.timestamp ?? Date.now();
+    this.logDebug(
+      [
+        `${traceId} content-send start`,
+        `target=${describeRecipientTarget(params.destination)}`,
+        `timestamp=${timestamp}`,
+        `content=${describeSignalContent(params.content)}`,
+      ].join(" "),
     );
+    try {
+      // Recipient resolution and prekey fetches are pure network reads and run
+      // OUTSIDE the session-state lock: a stalled unauthenticated prekey
+      // connection here used to hold the ratchet lock for tens of seconds,
+      // starving inbound decrypts and expiring queued sends (one typing
+      // indicator could cost the actual reply).
+      const destination = await this.resolveRecipient(
+        params.destination,
+        params.abortSignal,
+        traceId,
+      );
+      this.logDebug(
+        `${traceId} content-send resolved target=${describeRecipientTarget(params.destination)} destination=${describeServiceId(destination)}`,
+      );
+      let preKeyBundles = params.preKeyBundles;
+      if (!preKeyBundles) {
+        const warmDeviceIds = await this.listSessionDeviceIds(
+          destination,
+          params.stores.sessionStore,
+        );
+        if (warmDeviceIds.length > 0) {
+          this.logDebug(
+            `${traceId} content-send warm destination=${describeServiceId(destination)} devices=${warmDeviceIds.join(",")}`,
+          );
+        } else {
+          this.logDebug(
+            `${traceId} content-send prekeys start destination=${describeServiceId(destination)} source=fetch auth=${params.preKeyAuth ? "yes" : "no"}`,
+          );
+          preKeyBundles = await this.fetchPreKeyBundles({
+            destination,
+            ...(params.preKeyAuth !== undefined ? { preKeyAuth: params.preKeyAuth } : {}),
+            ...(params.abortSignal !== undefined ? { abortSignal: params.abortSignal } : {}),
+          });
+          this.logDebug(
+            `${traceId} content-send prekeys done destination=${describeServiceId(destination)} count=${preKeyBundles.length} devices=${describePreKeyBundleDevices(preKeyBundles)}`,
+          );
+          if (preKeyBundles.length === 0) {
+            throw new SignalTsStateError("Signal recipient has no available prekey bundles");
+          }
+        }
+      }
+      return await this.runSerializedSignalStateMutation(
+        traceId,
+        "content-send",
+        params.abortSignal,
+        async () =>
+          await this.sendContentMessageLocked({
+            ...params,
+            traceId,
+            timestamp,
+            destination,
+            ...(preKeyBundles !== undefined ? { preKeyBundles } : {}),
+          }),
+      );
+    } catch (err) {
+      this.logError(
+        `${traceId} content-send failed target=${describeRecipientTarget(params.destination)} timestamp=${timestamp} content=${describeSignalContent(params.content)}`,
+        err,
+      );
+      throw err;
+    }
+  }
+
+  /** Device ids with an established session, readable without the state lock. */
+  private async listSessionDeviceIds(
+    destination: ServiceId,
+    sessionStore: SendContentMessageParams["stores"]["sessionStore"],
+  ): Promise<number[]> {
+    const store = sessionStore as
+      | { listDeviceIds?: (serviceId: string) => Promise<number[]> }
+      | undefined;
+    if (!store || typeof store.listDeviceIds !== "function") {
+      // Custom stores without enumeration keep the bundle-driven path.
+      return [];
+    }
+    return await store.listDeviceIds(ProtocolAddress.new(destination, 1).name());
   }
 
   /**
@@ -1188,7 +1275,7 @@ export class SignalTsClient {
     params: DecryptIncomingEnvelopeParams & { traceId?: string },
   ): Promise<DecryptedIncomingMessage> {
     const traceId = params.traceId ?? createSignalTraceId("incoming-decrypt");
-    return await this.runSerializedSignalStateMutation(traceId, "incoming-decrypt", async () =>
+    return await this.runSerializedSignalStateMutation(traceId, "incoming-decrypt", undefined, async () =>
       decryptIncomingEnvelope(params),
     );
   }
@@ -1207,7 +1294,7 @@ export class SignalTsClient {
     traceId?: string;
   }): Promise<void> {
     const traceId = params.traceId ?? createSignalTraceId("session-archive");
-    await this.runSerializedSignalStateMutation(traceId, "session-archive", async () =>
+    await this.runSerializedSignalStateMutation(traceId, "session-archive", undefined, async () =>
       this.removeRecipientSessionDevice({
         traceId,
         operation: "session-archive",
@@ -1218,53 +1305,49 @@ export class SignalTsClient {
     );
   }
 
-  private async sendContentMessageUnlocked(
-    params: SendContentMessageParams,
+  private async sendContentMessageLocked(
+    params: Omit<SendContentMessageParams, "destination"> & {
+      traceId: string;
+      timestamp: number;
+      destination: ServiceId;
+    },
   ): Promise<{ timestamp: number }> {
-    const traceId = params.traceId ?? createSignalTraceId("content");
-    const timestamp = params.timestamp ?? Date.now();
-    this.logDebug(
-      [
-        `${traceId} content-send start`,
-        `target=${describeRecipientTarget(params.destination)}`,
-        `timestamp=${timestamp}`,
-        `content=${describeSignalContent(params.content)}`,
-      ].join(" "),
-    );
-    try {
-      const destination = await this.resolveRecipient(
-        params.destination,
-        params.abortSignal,
-        traceId,
-      );
+    const { traceId, timestamp, destination } = params;
+    const payload = encodeSignalContent(params.content);
+    this.logDebug(`${traceId} content-send payload encoded bytes=${payload.byteLength}`);
+    let contents =
+      params.preKeyBundles !== undefined
+        ? await this.buildDirectContentMessageContents({
+            traceId,
+            operation: "content-send",
+            destination,
+            payload,
+            stores: params.stores,
+            preKeyBundles: params.preKeyBundles,
+          })
+        : await this.buildWarmContentMessageContents({
+            traceId,
+            operation: "content-send",
+            destination,
+            payload,
+            stores: params.stores,
+          });
+    if (contents === null) {
+      // The warm sessions seen by the unlocked peek were archived before we
+      // acquired the lock. Rare enough that this in-lock fetch is acceptable;
+      // correctness beats latency on this path.
+      const preKeyBundles = await this.fetchPreKeyBundles({
+        destination,
+        ...(params.preKeyAuth !== undefined ? { preKeyAuth: params.preKeyAuth } : {}),
+        ...(params.abortSignal !== undefined ? { abortSignal: params.abortSignal } : {}),
+      });
       this.logDebug(
-        `${traceId} content-send resolved target=${describeRecipientTarget(params.destination)} destination=${describeServiceId(destination)}`,
-      );
-      const fetchParams: FetchPreKeysParams = { target: destination };
-      if (params.preKeyAuth !== undefined) {
-        fetchParams.auth = params.preKeyAuth;
-      }
-      if (params.abortSignal !== undefined) {
-        fetchParams.abortSignal = params.abortSignal;
-      }
-      if (this.options.userAgent !== undefined) {
-        fetchParams.userAgent = this.options.userAgent;
-      }
-      this.logDebug(
-        `${traceId} content-send prekeys start destination=${describeServiceId(destination)} source=${params.preKeyBundles ? "provided" : "fetch"} auth=${params.preKeyAuth ? "yes" : "no"}`,
-      );
-      const preKeyBundles =
-        params.preKeyBundles ??
-        (await fetchRecipientPreKeys(fetchParams)).preKeyBundles;
-      this.logDebug(
-        `${traceId} content-send prekeys done destination=${describeServiceId(destination)} count=${preKeyBundles.length} devices=${describePreKeyBundleDevices(preKeyBundles)}`,
+        `${traceId} content-send warm-fallback prekeys done destination=${describeServiceId(destination)} count=${preKeyBundles.length} devices=${describePreKeyBundleDevices(preKeyBundles)}`,
       );
       if (preKeyBundles.length === 0) {
         throw new SignalTsStateError("Signal recipient has no available prekey bundles");
       }
-      const payload = encodeSignalContent(params.content);
-      this.logDebug(`${traceId} content-send payload encoded bytes=${payload.byteLength}`);
-      let contents = await this.buildDirectContentMessageContents({
+      contents = await this.buildDirectContentMessageContents({
         traceId,
         operation: "content-send",
         destination,
@@ -1272,82 +1355,126 @@ export class SignalTsClient {
         stores: params.stores,
         preKeyBundles,
       });
-      const sendParams: SendEncryptedMessageParams = {
-        traceId,
-        destination,
-        timestamp,
-        contents,
-      };
-      if (params.onlineOnly !== undefined) {
-        sendParams.onlineOnly = params.onlineOnly;
-      }
-      if (params.urgent !== undefined) {
-        sendParams.urgent = params.urgent;
-      }
-      if (params.abortSignal !== undefined) {
-        sendParams.abortSignal = params.abortSignal;
-      }
-      let result: { timestamp: number };
-      try {
-        result = await this.sendEncryptedMessage(sendParams);
-      } catch (err) {
-        if (!isMismatchedDevicesError(err)) {
-          throw err;
-        }
-        const repair = await this.repairMismatchedDevices({
-          err,
-          traceId,
-          operation: "content-send",
-          destination,
-          stores: params.stores,
-        });
-        if (!repair) {
-          throw err;
-        }
-        const retryPreKeyBundles = await this.fetchPreKeyBundles({
-          destination,
-          ...(params.preKeyAuth !== undefined ? { preKeyAuth: params.preKeyAuth } : {}),
-          ...(params.abortSignal !== undefined ? { abortSignal: params.abortSignal } : {}),
-        });
-        this.logDebug(
-          `${traceId} content-send device-retry prekeys done destination=${describeServiceId(destination)} count=${retryPreKeyBundles.length} devices=${describePreKeyBundleDevices(retryPreKeyBundles)}`,
-        );
-        const refreshDeviceIds = repair.refreshAllDevices
-          ? new Set(retryPreKeyBundles.map((bundle) => bundle.deviceId()))
-          : repair.refreshDeviceIds;
-        contents = await this.buildDirectContentMessageContents({
-          traceId,
-          operation: "content-send:device-retry",
-          destination,
-          payload,
-          stores: params.stores,
-          preKeyBundles: retryPreKeyBundles,
-          refreshDeviceIds,
-        });
-        result = await this.sendEncryptedMessage({
-          ...sendParams,
-          traceId: `${traceId}:device-retry`,
-          contents,
-        });
-      }
-      this.logInfo(
-        `${traceId} content-send done destination=${describeServiceId(destination)} timestamp=${result.timestamp} devices=${describeOutboundDevices(contents)}`,
-      );
-      return result;
-    } catch (err) {
-      this.logError(
-        `${traceId} content-send failed target=${describeRecipientTarget(params.destination)} timestamp=${timestamp} content=${describeSignalContent(params.content)}`,
-        err,
-      );
-      throw err;
     }
+    const sendParams: SendEncryptedMessageParams = {
+      traceId,
+      destination,
+      timestamp,
+      contents,
+    };
+    if (params.onlineOnly !== undefined) {
+      sendParams.onlineOnly = params.onlineOnly;
+    }
+    if (params.urgent !== undefined) {
+      sendParams.urgent = params.urgent;
+    }
+    if (params.abortSignal !== undefined) {
+      sendParams.abortSignal = params.abortSignal;
+    }
+    let result: { timestamp: number };
+    try {
+      result = await this.sendEncryptedMessage(sendParams);
+    } catch (err) {
+      if (!isMismatchedDevicesError(err)) {
+        throw err;
+      }
+      const repair = await this.repairMismatchedDevices({
+        err,
+        traceId,
+        operation: "content-send",
+        destination,
+        stores: params.stores,
+      });
+      if (!repair) {
+        throw err;
+      }
+      const retryPreKeyBundles = await this.fetchPreKeyBundles({
+        destination,
+        ...(params.preKeyAuth !== undefined ? { preKeyAuth: params.preKeyAuth } : {}),
+        ...(params.abortSignal !== undefined ? { abortSignal: params.abortSignal } : {}),
+      });
+      this.logDebug(
+        `${traceId} content-send device-retry prekeys done destination=${describeServiceId(destination)} count=${retryPreKeyBundles.length} devices=${describePreKeyBundleDevices(retryPreKeyBundles)}`,
+      );
+      const refreshDeviceIds = repair.refreshAllDevices
+        ? new Set(retryPreKeyBundles.map((bundle) => bundle.deviceId()))
+        : repair.refreshDeviceIds;
+      contents = await this.buildDirectContentMessageContents({
+        traceId,
+        operation: "content-send:device-retry",
+        destination,
+        payload,
+        stores: params.stores,
+        preKeyBundles: retryPreKeyBundles,
+        refreshDeviceIds,
+      });
+      result = await this.sendEncryptedMessage({
+        ...sendParams,
+        traceId: `${traceId}:device-retry`,
+        contents,
+      });
+    }
+    this.logInfo(
+      `${traceId} content-send done destination=${describeServiceId(destination)} timestamp=${result.timestamp} devices=${describeOutboundDevices(contents)}`,
+    );
+    return result;
+  }
+
+  /**
+   * Encrypts to every device we already hold a session for, skipping the
+   * per-send prekey fetch entirely. A stale device set is corrected by the
+   * server's mismatched-devices response on send — the same repair contract
+   * the bundle-driven path relies on. Returns null when no session survives,
+   * so the caller falls back to prekey bundles.
+   */
+  private async buildWarmContentMessageContents({
+    traceId,
+    operation,
+    destination,
+    payload,
+    stores,
+  }: {
+    traceId: string;
+    operation: string;
+    destination: ServiceId;
+    payload: Uint8Array<ArrayBuffer>;
+    stores: Pick<LibsignalStores, "identityStore" | "sessionStore">;
+  }): Promise<Array<SendMessageRequest["contents"][number]> | null> {
+    const deviceIds = await this.listSessionDeviceIds(destination, stores.sessionStore);
+    if (deviceIds.length === 0) {
+      return null;
+    }
+    const localAddress = this.localAddress();
+    const contents: Array<SendMessageRequest["contents"][number]> = [];
+    for (const deviceId of deviceIds) {
+      const remoteAddress = ProtocolAddress.new(destination, deviceId);
+      const session = await stores.sessionStore.getSession(remoteAddress);
+      if (!session) {
+        continue;
+      }
+      this.logDebug(
+        `${traceId} ${operation} encrypt device=${deviceId} registration=${session.remoteRegistrationId()} source=session`,
+      );
+      const encrypted = await encryptPayloadForDevice({
+        localAddress,
+        device: {
+          serviceId: destination,
+          deviceId,
+          registrationId: session.remoteRegistrationId(),
+        },
+        payload,
+        stores,
+      });
+      contents.push(encrypted);
+    }
+    return contents.length > 0 ? contents : null;
   }
 
   async sendRetryReceiptMessage(
     params: SendRetryReceiptMessageParams,
   ): Promise<{ timestamp: number }> {
     const traceId = params.traceId ?? createSignalTraceId("retry-receipt");
-    return await this.runSerializedSignalStateMutation(traceId, "retry-receipt", async () => {
+    return await this.runSerializedSignalStateMutation(traceId, "retry-receipt", params.abortSignal, async () => {
     const timestamp = params.timestamp ?? Date.now();
     this.logDebug(
       [
@@ -1435,7 +1562,6 @@ export class SignalTsClient {
     params: SendSealedContentMessageParams,
   ): Promise<{ timestamp: number }> {
     const traceId = params.traceId ?? createSignalTraceId("sealed");
-    return await this.runSerializedSignalStateMutation(traceId, "sealed-send", async () => {
     const timestamp = params.timestamp ?? Date.now();
     this.logDebug(
       [
@@ -1447,70 +1573,79 @@ export class SignalTsClient {
       ].join(" "),
     );
     try {
+      // Resolution, prekey fetches, and the sealed-sender connection are pure
+      // network work and stay OUTSIDE the session-state lock; only bundle
+      // processing and ratchet encryption below mutate session state.
       const destination = await this.resolveRecipient(
         params.destination,
         params.abortSignal,
         traceId,
       );
-      const fetchParams: FetchPreKeysParams = { target: destination };
-      if (params.preKeyAuth !== undefined) {
-        fetchParams.auth = params.preKeyAuth;
-      }
-      if (params.abortSignal !== undefined) {
-        fetchParams.abortSignal = params.abortSignal;
-      }
-      if (this.options.userAgent !== undefined) {
-        fetchParams.userAgent = this.options.userAgent;
-      }
       this.logDebug(
         `${traceId} sealed-send prekeys start destination=${describeServiceId(destination)} source=${params.preKeyBundles ? "provided" : "fetch"} auth=${params.preKeyAuth ? "yes" : "no"}`,
       );
       const preKeyBundles =
         params.preKeyBundles ??
-        (await fetchRecipientPreKeys(fetchParams)).preKeyBundles;
+        (await this.fetchPreKeyBundles({
+          destination,
+          ...(params.preKeyAuth !== undefined ? { preKeyAuth: params.preKeyAuth } : {}),
+          ...(params.abortSignal !== undefined ? { abortSignal: params.abortSignal } : {}),
+        }));
       this.logDebug(
         `${traceId} sealed-send prekeys done destination=${describeServiceId(destination)} count=${preKeyBundles.length} devices=${describePreKeyBundleDevices(preKeyBundles)}`,
       );
       if (preKeyBundles.length === 0) {
         throw new SignalTsStateError("Signal recipient has no available prekey bundles");
       }
-      const localAddress = this.localAddress();
-      const payload = encodeSignalContent(params.content);
-      const contents: Array<SendSealedMessageRequest["contents"][number]> = [];
-      for (const bundle of preKeyBundles) {
-        const remoteAddress = ProtocolAddress.new(destination, bundle.deviceId());
-        const existingSession = await params.stores.sessionStore.getSession(remoteAddress);
-        this.logDebug(
-          `${traceId} sealed-send encrypt device=${bundle.deviceId()} registration=${bundle.registrationId()} existingSession=${existingSession ? "yes" : "no"}`,
-        );
-        if (!existingSession) {
-          await processPreKeyBundle(
-            bundle,
+      // Bundle processing and sealed-sender encryption mutate session state,
+      // so only this block holds the lock; the connection and send below are
+      // pure network work.
+      const contents = await this.runSerializedSignalStateMutation(
+        traceId,
+        "sealed-send",
+        params.abortSignal,
+        async () => {
+        const localAddress = this.localAddress();
+        const payload = encodeSignalContent(params.content);
+        const encryptedContents: Array<SendSealedMessageRequest["contents"][number]> = [];
+        for (const bundle of preKeyBundles) {
+          const remoteAddress = ProtocolAddress.new(destination, bundle.deviceId());
+          const existingSession = await params.stores.sessionStore.getSession(remoteAddress);
+          this.logDebug(
+            `${traceId} sealed-send encrypt device=${bundle.deviceId()} registration=${bundle.registrationId()} existingSession=${existingSession ? "yes" : "no"}`,
+          );
+          if (!existingSession) {
+            await processPreKeyBundle(
+              bundle,
+              remoteAddress,
+              localAddress,
+              params.stores.sessionStore,
+              params.stores.identityStore,
+            );
+            this.logDebug(
+              `${traceId} sealed-send processed prekey bundle device=${bundle.deviceId()} registration=${bundle.registrationId()}`,
+            );
+          }
+          const encrypted = await sealedSenderEncryptMessage(
+            padSignalMessageBody(payload),
             remoteAddress,
-            localAddress,
+            params.senderCertificate,
             params.stores.sessionStore,
             params.stores.identityStore,
           );
           this.logDebug(
-            `${traceId} sealed-send processed prekey bundle device=${bundle.deviceId()} registration=${bundle.registrationId()}`,
+            `${traceId} sealed-send encrypted device=${bundle.deviceId()} registration=${bundle.registrationId()} bytes=${encrypted.byteLength}`,
           );
+          encryptedContents.push({
+            deviceId: bundle.deviceId(),
+            registrationId: bundle.registrationId(),
+            contents: encrypted,
+          });
         }
-        const encrypted = await sealedSenderEncryptMessage(
-          padSignalMessageBody(payload),
-          remoteAddress,
-          params.senderCertificate,
-          params.stores.sessionStore,
-          params.stores.identityStore,
-        );
-        this.logDebug(
-          `${traceId} sealed-send encrypted device=${bundle.deviceId()} registration=${bundle.registrationId()} bytes=${encrypted.byteLength}`,
-        );
-        contents.push({
-          deviceId: bundle.deviceId(),
-          registrationId: bundle.registrationId(),
-          contents: encrypted,
-        });
-      }
+        return encryptedContents;
+        },
+      );
+
       this.logDebug(
         `${traceId} sealed-send connection start destination=${describeServiceId(destination)}`,
       );
@@ -1546,7 +1681,6 @@ export class SignalTsClient {
       );
       throw err;
     }
-    });
   }
 
   async sendSyncMessage(params: SendSyncMessageParams): Promise<{ timestamp: number }> {
@@ -1591,7 +1725,7 @@ export class SignalTsClient {
     params: SendSyncContentMessageParams,
   ): Promise<{ timestamp: number }> {
     const traceId = params.traceId ?? createSignalTraceId("sync-content");
-    return await this.runSerializedSignalStateMutation(traceId, "sync-content", async () => {
+    return await this.runSerializedSignalStateMutation(traceId, "sync-content", params.abortSignal, async () => {
     if (params.preKeyBundles.length === 0) {
       this.logWarn(`${traceId} sync-content rejected: no linked-device prekey bundles`);
       throw new SignalTsStateError("Signal sync message requires linked-device prekey bundles");
@@ -1729,16 +1863,6 @@ export class SignalTsClient {
     recipients: number;
   }> {
     const traceId = params.traceId ?? createSignalTraceId("group-content");
-    return await this.runSerializedSignalStateMutation(traceId, "group-content", async () =>
-      await this.sendGroupContentMessageUnlocked({ ...params, traceId }),
-    );
-  }
-
-  private async sendGroupContentMessageUnlocked(params: SendGroupContentMessageParams): Promise<{
-    timestamp: number;
-    recipients: number;
-  }> {
-    const traceId = params.traceId ?? createSignalTraceId("group-content");
     const timestamp = params.timestamp ?? Date.now();
     this.logDebug(
       [
@@ -1751,10 +1875,10 @@ export class SignalTsClient {
       ].join(" "),
     );
     try {
-      const localAddress = ProtocolAddress.new(
-        Aci.fromUuid(this.options.account.device.aci),
-        this.options.account.device.deviceId,
-      );
+      // Same contract as sendContentMessage: recipient resolution and member
+      // prekey fetches are pure network reads and run OUTSIDE the state lock.
+      // Members we already hold sessions for skip the fetch entirely; their
+      // devices are enumerated from the session store inside the lock.
       const recipients = await this.resolveGroupRecipients(
         params.members,
         params.abortSignal,
@@ -1766,83 +1890,50 @@ export class SignalTsClient {
       if (recipients.length === 0) {
         throw new SignalTsStateError("Signal group message has no remote recipients");
       }
-      const senderKeyDistribution = await SenderKeyDistributionMessage.create(
-        localAddress,
-        params.group.distributionId,
-        params.stores.senderKeyStore,
-      );
-      const senderKeyDistributionBytes = senderKeyDistribution.serialize();
-      this.logDebug(
-        `${traceId} group-content sender-key-distribution created bytes=${senderKeyDistributionBytes.byteLength}`,
-      );
-      const memberBundles: Array<{ destination: ServiceId; bundles: PreKeyBundle[] }> = [];
+      const memberBundles = new Map<string, PreKeyBundle[]>();
       for (const destination of recipients) {
-        const providedBundles = params.memberPreKeyBundles?.get(destination.getServiceIdString());
-        this.logDebug(
-          `${traceId} group-content member prekeys start destination=${describeServiceId(destination)} source=${providedBundles ? "provided" : "fetch"} auth=${params.preKeyAuth ? "yes" : "no"}`,
+        const memberKey = destination.getServiceIdString();
+        const providedBundles = params.memberPreKeyBundles?.get(memberKey);
+        if (providedBundles) {
+          memberBundles.set(memberKey, providedBundles);
+          continue;
+        }
+        const warmDeviceIds = await this.listSessionDeviceIds(
+          destination,
+          params.stores.sessionStore,
         );
-        const bundles =
-          providedBundles ??
-          (await this.fetchPreKeyBundlesForGroupMember({
-            destination,
-            preKeyAuth: params.preKeyAuth,
-            abortSignal: params.abortSignal,
-          }));
+        if (warmDeviceIds.length > 0) {
+          this.logDebug(
+            `${traceId} group-content member warm destination=${describeServiceId(destination)} devices=${warmDeviceIds.join(",")}`,
+          );
+          continue;
+        }
+        this.logDebug(
+          `${traceId} group-content member prekeys start destination=${describeServiceId(destination)} source=fetch auth=${params.preKeyAuth ? "yes" : "no"}`,
+        );
+        const bundles = await this.fetchPreKeyBundlesForGroupMember({
+          destination,
+          preKeyAuth: params.preKeyAuth,
+          abortSignal: params.abortSignal,
+        });
         this.logDebug(
           `${traceId} group-content member prekeys done destination=${describeServiceId(destination)} count=${bundles.length} devices=${describePreKeyBundleDevices(bundles)}`,
         );
-        await this.sendContentMessageUnlocked({
-          traceId: `${traceId}:sender-key:${describeServiceId(destination)}`,
-          destination,
-          content: { senderKeyDistributionMessage: senderKeyDistributionBytes },
-          stores: params.stores,
-          preKeyBundles: bundles,
-          timestamp,
-          ...(params.onlineOnly !== undefined ? { onlineOnly: params.onlineOnly } : {}),
-          ...(params.urgent !== undefined ? { urgent: params.urgent } : {}),
-          ...(params.abortSignal ? { abortSignal: params.abortSignal } : {}),
-        });
-        memberBundles.push({ destination, bundles });
+        memberBundles.set(memberKey, bundles);
       }
-      const groupPayload = encodeSignalContent(params.content);
-      this.logDebug(`${traceId} group-content payload encoded bytes=${groupPayload.byteLength}`);
-      const groupCiphertext = await groupEncrypt(
-        localAddress,
-        params.group.distributionId,
-        params.stores.senderKeyStore,
-        padSignalMessageBody(groupPayload),
-      );
-      this.logDebug(
-        `${traceId} group-content encrypted bytes=${groupCiphertext.serialize().byteLength}`,
-      );
-      await Promise.all(
-        memberBundles.map(async ({ destination, bundles }) => {
-          const contents = bundles.map((bundle) => ({
-            deviceId: bundle.deviceId(),
-            registrationId: bundle.registrationId(),
-            contents: groupCiphertext,
-          }));
-          this.logDebug(
-            `${traceId} group-content fanout start destination=${describeServiceId(destination)} devices=${describeOutboundDevices(contents)}`,
-          );
-          await this.sendEncryptedMessage({
-            traceId: `${traceId}:group-fanout:${describeServiceId(destination)}`,
-            destination,
+      return await this.runSerializedSignalStateMutation(
+        traceId,
+        "group-content",
+        params.abortSignal,
+        async () =>
+          await this.sendGroupContentMessageLocked({
+            ...params,
+            traceId,
             timestamp,
-            contents,
-            ...(params.onlineOnly !== undefined ? { onlineOnly: params.onlineOnly } : {}),
-            ...(params.urgent !== undefined ? { urgent: params.urgent } : {}),
-            ...(params.abortSignal ? { abortSignal: params.abortSignal } : {}),
-          });
-          this.logDebug(
-            `${traceId} group-content fanout done destination=${describeServiceId(destination)} devices=${describeOutboundDevices(contents)}`,
-          );
-        }),
+            recipients,
+            memberBundles,
+          }),
       );
-      this.logInfo(
-        `${traceId} group-content done timestamp=${timestamp} recipients=${recipients.length}`,
-      );
-      return { timestamp, recipients: recipients.length };
     } catch (err) {
       this.logError(
         `${traceId} group-content failed timestamp=${timestamp} members=${params.members.length} content=${describeSignalContent(params.content)}`,
@@ -1850,6 +1941,125 @@ export class SignalTsClient {
       );
       throw err;
     }
+  }
+
+  private async sendGroupContentMessageLocked(
+    params: SendGroupContentMessageParams & {
+      traceId: string;
+      timestamp: number;
+      recipients: ServiceId[];
+      memberBundles: ReadonlyMap<string, PreKeyBundle[]>;
+    },
+  ): Promise<{
+    timestamp: number;
+    recipients: number;
+  }> {
+    const { traceId, timestamp, recipients, memberBundles } = params;
+    const localAddress = ProtocolAddress.new(
+      Aci.fromUuid(this.options.account.device.aci),
+      this.options.account.device.deviceId,
+    );
+    const senderKeyDistribution = await SenderKeyDistributionMessage.create(
+      localAddress,
+      params.group.distributionId,
+      params.stores.senderKeyStore,
+    );
+    const senderKeyDistributionBytes = senderKeyDistribution.serialize();
+    this.logDebug(
+      `${traceId} group-content sender-key-distribution created bytes=${senderKeyDistributionBytes.byteLength}`,
+    );
+    for (const destination of recipients) {
+      const bundles = memberBundles.get(destination.getServiceIdString());
+      // Warm members (no fetched bundles) take the session-driven path; if
+      // their sessions were archived since the unlocked peek, the locked
+      // send falls back to an in-lock bundle fetch and re-establishes them.
+      await this.sendContentMessageLocked({
+        traceId: `${traceId}:sender-key:${describeServiceId(destination)}`,
+        destination,
+        content: { senderKeyDistributionMessage: senderKeyDistributionBytes },
+        stores: params.stores,
+        ...(bundles !== undefined ? { preKeyBundles: bundles } : {}),
+        timestamp,
+        ...(params.preKeyAuth !== undefined ? { preKeyAuth: params.preKeyAuth } : {}),
+        ...(params.onlineOnly !== undefined ? { onlineOnly: params.onlineOnly } : {}),
+        ...(params.urgent !== undefined ? { urgent: params.urgent } : {}),
+        ...(params.abortSignal ? { abortSignal: params.abortSignal } : {}),
+      });
+    }
+    const groupPayload = encodeSignalContent(params.content);
+    this.logDebug(`${traceId} group-content payload encoded bytes=${groupPayload.byteLength}`);
+    const groupCiphertext = await groupEncrypt(
+      localAddress,
+      params.group.distributionId,
+      params.stores.senderKeyStore,
+      padSignalMessageBody(groupPayload),
+    );
+    this.logDebug(
+      `${traceId} group-content encrypted bytes=${groupCiphertext.serialize().byteLength}`,
+    );
+    await Promise.all(
+      recipients.map(async (destination) => {
+        const devices = await this.resolveGroupFanoutDevices({
+          destination,
+          bundles: memberBundles.get(destination.getServiceIdString()),
+          sessionStore: params.stores.sessionStore,
+        });
+        const contents = devices.map((device) => ({
+          deviceId: device.deviceId,
+          registrationId: device.registrationId,
+          contents: groupCiphertext,
+        }));
+        this.logDebug(
+          `${traceId} group-content fanout start destination=${describeServiceId(destination)} devices=${describeOutboundDevices(contents)}`,
+        );
+        await this.sendEncryptedMessage({
+          traceId: `${traceId}:group-fanout:${describeServiceId(destination)}`,
+          destination,
+          timestamp,
+          contents,
+          ...(params.onlineOnly !== undefined ? { onlineOnly: params.onlineOnly } : {}),
+          ...(params.urgent !== undefined ? { urgent: params.urgent } : {}),
+          ...(params.abortSignal ? { abortSignal: params.abortSignal } : {}),
+        });
+        this.logDebug(
+          `${traceId} group-content fanout done destination=${describeServiceId(destination)} devices=${describeOutboundDevices(contents)}`,
+        );
+      }),
+    );
+    this.logInfo(
+      `${traceId} group-content done timestamp=${timestamp} recipients=${recipients.length}`,
+    );
+    return { timestamp, recipients: recipients.length };
+  }
+
+  /**
+   * Devices for one group fanout target: fetched bundles for cold members,
+   * the session store for warm ones. Runs inside the state lock, after the
+   * sender-key distribution send has (re-)established any missing sessions.
+   */
+  private async resolveGroupFanoutDevices({
+    destination,
+    bundles,
+    sessionStore,
+  }: {
+    destination: ServiceId;
+    bundles: PreKeyBundle[] | undefined;
+    sessionStore: LibsignalStores["sessionStore"];
+  }): Promise<Array<{ deviceId: number; registrationId: number }>> {
+    if (bundles !== undefined) {
+      return bundles.map((bundle) => ({
+        deviceId: bundle.deviceId(),
+        registrationId: bundle.registrationId(),
+      }));
+    }
+    const devices: Array<{ deviceId: number; registrationId: number }> = [];
+    for (const deviceId of await this.listSessionDeviceIds(destination, sessionStore)) {
+      const session = await sessionStore.getSession(ProtocolAddress.new(destination, deviceId));
+      if (session) {
+        devices.push({ deviceId, registrationId: session.remoteRegistrationId() });
+      }
+    }
+    return devices;
   }
 
   async uploadAttachment(params: UploadAttachmentParams): Promise<EncryptedSignalAttachment> {

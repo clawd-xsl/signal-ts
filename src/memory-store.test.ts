@@ -1,4 +1,4 @@
-import { Direction, PrivateKey, ProtocolAddress } from "@signalapp/libsignal-client";
+import { Direction, PrivateKey, ProtocolAddress, SessionRecord } from "@signalapp/libsignal-client";
 import { describe, expect, it } from "vitest";
 import { InMemorySignalRepository } from "./memory-store.js";
 import { RepositoryIdentityKeyStore } from "./store.js";
@@ -25,5 +25,21 @@ describe("InMemorySignalRepository", () => {
     await store.saveIdentity(address, first);
     expect(await store.isTrustedIdentity(address, first, Direction.Sending)).toBe(true);
     expect(await store.isTrustedIdentity(address, second, Direction.Sending)).toBe(false);
+  });
+
+  it("lists session device ids per service id", async () => {
+    const repository = new InMemorySignalRepository({ registrationId: 42 });
+    const record = {} as SessionRecord;
+    const serviceId = "11111111-1111-4111-8111-111111111111";
+    await repository.saveSession(`${serviceId}.2`, record);
+    await repository.saveSession(`${serviceId}.1`, record);
+    await repository.saveSession("22222222-2222-4222-8222-222222222222.1", record);
+
+    expect(await repository.listSessionDeviceIds(serviceId)).toEqual([1, 2]);
+    await repository.removeSession(`${serviceId}.1`);
+    expect(await repository.listSessionDeviceIds(serviceId)).toEqual([2]);
+    expect(await repository.listSessionDeviceIds("33333333-3333-4333-8333-333333333333")).toEqual(
+      [],
+    );
   });
 });

@@ -42,6 +42,8 @@ export interface SignalRepository {
   getSession(address: string): Promise<SessionRecord | null>;
   saveSession(address: string, record: SessionRecord): Promise<void>;
   removeSession(address: string): Promise<void>;
+  /** Device ids we hold a session for, so warm sends can skip prekey fetches. */
+  listSessionDeviceIds(serviceId: string): Promise<number[]>;
 
   getPreKey(id: number): Promise<PreKeyRecord | null>;
   savePreKey(id: number, record: PreKeyRecord): Promise<void>;
@@ -60,6 +62,25 @@ export interface SignalRepository {
 
 export function protocolAddressKey(address: ProtocolAddress): string {
   return `${address.name()}.${address.deviceId()}`;
+}
+
+/** Parses `protocolAddressKey`-shaped keys back into device ids for one service id. */
+export function sessionDeviceIdsForServiceId(
+  keys: Iterable<string>,
+  serviceId: string,
+): number[] {
+  const prefix = `${serviceId}.`;
+  const deviceIds: number[] = [];
+  for (const key of keys) {
+    if (!key.startsWith(prefix)) {
+      continue;
+    }
+    const deviceId = Number.parseInt(key.slice(prefix.length), 10);
+    if (Number.isInteger(deviceId) && deviceId > 0) {
+      deviceIds.push(deviceId);
+    }
+  }
+  return deviceIds.sort((a, b) => a - b);
 }
 
 export function senderKeyKey(sender: string, distributionId: Uuid): string {
@@ -85,6 +106,10 @@ export class RepositorySessionStore extends SessionStore {
 
   async removeSession(name: ProtocolAddress): Promise<void> {
     await this.repository.removeSession(protocolAddressKey(name));
+  }
+
+  async listDeviceIds(serviceId: string): Promise<number[]> {
+    return await this.repository.listSessionDeviceIds(serviceId);
   }
 
   async getExistingSessions(addresses: ProtocolAddress[]): Promise<SessionRecord[]> {

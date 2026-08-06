@@ -16,6 +16,7 @@ import { base64ToBytes, bytesToBase64, equalBytes } from "./bytes.js";
 import { SignalTsStateError } from "./errors.js";
 import {
   senderKeyKey,
+  sessionDeviceIdsForServiceId,
   type SerializedSignalRepository,
   type SignalRepository,
 } from "./store.js";
@@ -193,6 +194,10 @@ export class FileSignalRepository implements SignalRepository {
   async removeSession(address: string): Promise<void> {
     this.sessions.delete(address);
     await this.persist();
+  }
+
+  async listSessionDeviceIds(serviceId: string): Promise<number[]> {
+    return sessionDeviceIdsForServiceId(this.sessions.keys(), serviceId);
   }
 
   async getPreKey(id: number): Promise<PreKeyRecord | null> {

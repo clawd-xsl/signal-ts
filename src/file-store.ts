@@ -14,6 +14,7 @@ import {
 import type { SignalAccountState } from "./account.js";
 import { base64ToBytes, bytesToBase64, equalBytes } from "./bytes.js";
 import { SignalTsStateError } from "./errors.js";
+import { SqliteSignalIncomingEnvelopeStore } from "./incoming-envelope-store.js";
 import {
   senderKeyKey,
   sessionDeviceIdsForServiceId,
@@ -113,6 +114,7 @@ export class FileSignalRepository implements SignalRepository {
   private readonly usedKyberPreKeys = new Set<string>();
   private account: FileSignalAccountState | undefined;
   private pendingPersist: Promise<void> = Promise.resolve();
+  private incomingEnvelopeStore: SqliteSignalIncomingEnvelopeStore | undefined;
 
   private constructor(
     private readonly filePath: string,
@@ -123,8 +125,16 @@ export class FileSignalRepository implements SignalRepository {
     hydrateMap(data.repository.identities, this.identities, PublicKey.deserialize);
     hydrateMap(data.repository.sessions, this.sessions, SessionRecord.deserialize);
     hydrateNumericMap(data.repository.preKeys, this.preKeys, PreKeyRecord.deserialize);
-    hydrateNumericMap(data.repository.signedPreKeys, this.signedPreKeys, SignedPreKeyRecord.deserialize);
-    hydrateNumericMap(data.repository.kyberPreKeys, this.kyberPreKeys, KyberPreKeyRecord.deserialize);
+    hydrateNumericMap(
+      data.repository.signedPreKeys,
+      this.signedPreKeys,
+      SignedPreKeyRecord.deserialize,
+    );
+    hydrateNumericMap(
+      data.repository.kyberPreKeys,
+      this.kyberPreKeys,
+      KyberPreKeyRecord.deserialize,
+    );
     hydrateMap(data.repository.senderKeys, this.senderKeys, SenderKeyRecord.deserialize);
     for (const [id, group] of Object.entries(data.groups)) {
       this.groups.set(id, group);
@@ -232,11 +242,7 @@ export class FileSignalRepository implements SignalRepository {
     await this.persist();
   }
 
-  async markKyberPreKeyUsed(
-    id: number,
-    signedPreKeyId: number,
-    baseKey: PublicKey,
-  ): Promise<void> {
+  async markKyberPreKeyUsed(id: number, signedPreKeyId: number, baseKey: PublicKey): Promise<void> {
     this.usedKyberPreKeys.add(`${id}:${signedPreKeyId}:${bytesToBase64(baseKey.serialize())}`);
     await this.persist();
   }
@@ -312,8 +318,19 @@ export class FileSignalRepository implements SignalRepository {
     return `${this.filePath}.stickers`;
   }
 
+  getIncomingEnvelopeStore(): SqliteSignalIncomingEnvelopeStore {
+    this.incomingEnvelopeStore ??= new SqliteSignalIncomingEnvelopeStore(
+      `${this.filePath}.incoming.sqlite`,
+    );
+    return this.incomingEnvelopeStore;
+  }
+
   getStickerFilePath(packId: string, fileName: string): string {
-    return join(this.stickerStorePath(), normalizeStickerPackId(packId), normalizeStickerFileName(fileName));
+    return join(
+      this.stickerStorePath(),
+      normalizeStickerPackId(packId),
+      normalizeStickerFileName(fileName),
+    );
   }
 
   snapshot(): FileSignalStoreData {
@@ -323,9 +340,7 @@ export class FileSignalRepository implements SignalRepository {
       repository: this.repositorySnapshot(),
       ...(account ? { account } : {}),
       groups: Object.fromEntries([...this.groups].sort(([a], [b]) => a.localeCompare(b))),
-      recipients: Object.fromEntries(
-        [...this.recipients].sort(([a], [b]) => a.localeCompare(b)),
-      ),
+      recipients: Object.fromEntries([...this.recipients].sort(([a], [b]) => a.localeCompare(b))),
       stickerPacks: Object.fromEntries(
         [...this.stickerPacks].sort(([a], [b]) => a.localeCompare(b)),
       ),

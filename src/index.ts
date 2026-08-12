@@ -9,6 +9,7 @@ export * from "./errors.js";
 export * from "./events.js";
 export * from "./file-store.js";
 export * from "./inbound.js";
+export * from "./incoming-envelope-store.js";
 export * from "./link-device.js";
 export * from "./memory-store.js";
 export * from "./messages.js";

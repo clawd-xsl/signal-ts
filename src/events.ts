@@ -3,7 +3,8 @@ import type { Bytes } from "./bytes.js";
 export type SignalIncomingEnvelope = {
   envelope: Bytes;
   timestamp: number;
-  ack: () => void;
+  /** Marks host processing complete; Signal server acknowledgement is handled internally. */
+  ack: () => Promise<void>;
 };
 
 export type SignalClientEventMap = {
@@ -15,7 +16,9 @@ export type SignalClientEventMap = {
 
 export type SignalEventName = keyof SignalClientEventMap;
 
-export type SignalEventHandler<K extends SignalEventName> = (event: SignalClientEventMap[K]) => void;
+export type SignalEventHandler<K extends SignalEventName> = (
+  event: SignalClientEventMap[K],
+) => void;
 
 export class SignalEventHub {
   private readonly listeners = new Map<SignalEventName, Set<(event: unknown) => void>>();

@@ -1,3 +1,7 @@
+import { existsSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import {
   Aci,
   ErrorCode,
@@ -19,8 +23,12 @@ import {
   type SendContentMessageParams,
   type UploadAttachmentParams,
   type SignalChatConnection,
+  type SignalConnectionFactory,
 } from "./client.js";
 import { encryptPayloadForDevice } from "./crypto.js";
+import {
+  SqliteSignalIncomingEnvelopeStore,
+} from "./incoming-envelope-store.js";
 import { InMemorySignalRepository } from "./memory-store.js";
 import type { SignalAttachmentPointer, SignalContent } from "./messages.js";
 import { createLibsignalStores, type LibsignalStores } from "./store.js";
@@ -89,10 +97,7 @@ async function createGeneratedAccount({
   const kyberPreKeyId = 1;
   const kyberKeyPair = KEMKeyPair.generate();
   const kyberPreKeySignature = identityKey.sign(kyberKeyPair.getPublicKey().serialize());
-  await repository.savePreKey(
-    preKeyId,
-    PreKeyRecord.new(preKeyId, preKey.getPublicKey(), preKey),
-  );
+  await repository.savePreKey(preKeyId, PreKeyRecord.new(preKeyId, preKey.getPublicKey(), preKey));
   await repository.saveSignedPreKey(
     signedPreKeyId,
     SignedPreKeyRecord.new(
@@ -146,6 +151,441 @@ function createAttachmentPointer(overrides: Partial<SignalAttachmentPointer> = {
 }
 
 describe("SignalTsClient", () => {
+  it("persists and server-acks inbound envelopes before exposing them to consumers", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "signal-ts-client-incoming-"));
+    const store = new SqliteSignalIncomingEnvelopeStore(path.join(directory, "incoming.sqlite"));
+    let listener: Parameters<SignalConnectionFactory>[0]["listener"] | undefined;
+    const connection: SignalChatConnection = {
+      sendMessage: vi.fn(async () => undefined),
+      disconnect: vi.fn(async () => undefined),
+      connectionInfo: () => ({ localPort: 1, ipVersion: "IPv4", toString: () => "fake" }),
+    };
+    const client = new SignalTsClient({
+      account: {
+        auth: { username: "user.1", password: "pass" },
+        device: {
+          aci: "11111111-1111-4111-8111-111111111111",
+          deviceId: 1,
+          registrationId: 42,
+        },
+      },
+      incomingEnvelopeStore: store,
+      connectionFactory: async (params) => {
+        listener = params.listener;
+        return connection;
+      },
+    });
+    const envelope = new Uint8Array([9, 8, 7]);
+    const serverAck = vi.fn(() => {
+      expect(existsSync(path.join(directory, "incoming.sqlite"))).toBe(true);
+    });
+    const received: Array<{ ack: () => Promise<void> }> = [];
+    client.on("incoming", (incoming) => received.push(incoming));
+
+    try {
+      await client.connect();
+      listener?.onIncomingMessage(envelope, 200, { send: serverAck } as never);
+      listener?.onQueueEmpty();
+      await client.startIncomingDelivery();
+      await vi.waitFor(() => expect(received).toHaveLength(1));
+
+      expect(serverAck).toHaveBeenCalledOnce();
+      await client.disconnect();
+      await client.connect();
+      listener?.onQueueEmpty();
+      await client.startIncomingDelivery();
+      await vi.waitFor(() => expect(received).toHaveLength(2));
+
+      const complete = vi.spyOn(store, "complete").mockRejectedValueOnce(new Error("disk busy"));
+      await expect(received[1]!.ack()).rejects.toThrow("disk busy");
+      await vi.waitFor(() => expect(received).toHaveLength(3));
+      await received[2]!.ack();
+      expect(complete).toHaveBeenCalledTimes(2);
+      expect(await store.listPending(16)).toEqual([]);
+
+      listener?.onIncomingMessage(envelope, 200, { send: serverAck } as never);
+      await vi.waitFor(() => expect(serverAck).toHaveBeenCalledTimes(2));
+      expect(received).toHaveLength(3);
+    } finally {
+      await client.disconnect();
+      store.close();
+      await rm(directory, { recursive: true });
+    }
+  });
+
+  it("replays an unfinished delivery after interruption and ignores the old listener", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "signal-ts-client-reconnect-"));
+    const store = new SqliteSignalIncomingEnvelopeStore(path.join(directory, "incoming.sqlite"));
+    const listeners: Array<Parameters<SignalConnectionFactory>[0]["listener"]> = [];
+    const disconnects: Array<ReturnType<typeof vi.fn>> = [];
+    const client = new SignalTsClient({
+      account: {
+        auth: { username: "user.1", password: "pass" },
+        device: {
+          aci: "11111111-1111-4111-8111-111111111111",
+          deviceId: 1,
+          registrationId: 42,
+        },
+      },
+      incomingEnvelopeStore: store,
+      connectionFactory: async ({ listener }) => {
+        listeners.push(listener);
+        const disconnect = vi.fn(async () => undefined);
+        disconnects.push(disconnect);
+        return {
+          sendMessage: vi.fn(async () => undefined),
+          disconnect,
+          connectionInfo: () => ({ localPort: 1, ipVersion: "IPv4", toString: () => "fake" }),
+        };
+      },
+    });
+    const received: Array<{ ack: () => Promise<void> }> = [];
+    client.on("incoming", (incoming) => received.push(incoming));
+    const envelope = new Uint8Array([6, 5, 4]);
+
+    try {
+      await client.connect();
+      listeners[0]!.onIncomingMessage(envelope, 100, { send: vi.fn() } as never);
+      listeners[0]!.onQueueEmpty();
+      await client.startIncomingDelivery();
+      await vi.waitFor(() => expect(received).toHaveLength(1));
+
+      listeners[0]!.onConnectionInterrupted(new Error("socket lost") as never);
+      await client.disconnect();
+      await client.connect();
+
+      const staleAck = vi.fn();
+      listeners[0]!.onQueueEmpty();
+      listeners[0]!.onIncomingMessage(new Uint8Array([1]), 200, { send: staleAck } as never);
+      await client.startIncomingDelivery();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(received).toHaveLength(1);
+      expect(staleAck).not.toHaveBeenCalled();
+
+      listeners[1]!.onQueueEmpty();
+      await vi.waitFor(() => expect(received).toHaveLength(2));
+      const complete = vi.spyOn(store, "complete").mockRejectedValueOnce(new Error("disk busy"));
+      await expect(received[0]!.ack()).rejects.toThrow("disk busy");
+      listeners[1]!.onQueueEmpty();
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(received).toHaveLength(2);
+      await received[1]!.ack();
+      expect(complete).toHaveBeenCalledTimes(2);
+      expect(disconnects[0]).toHaveBeenCalledOnce();
+    } finally {
+      await client.disconnect();
+      store.close();
+      await rm(directory, { recursive: true });
+    }
+  });
+
+  it("retries a transient durable-inbox drain failure", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "signal-ts-client-retry-"));
+    const store = new SqliteSignalIncomingEnvelopeStore(path.join(directory, "incoming.sqlite"));
+    await store.accept({ envelope: new Uint8Array([3, 2, 1]), serverDeliveredTimestamp: 100 });
+    const listPending = vi.spyOn(store, "listPending");
+    listPending.mockRejectedValueOnce(new Error("disk busy"));
+    let listener: Parameters<SignalConnectionFactory>[0]["listener"] | undefined;
+    const client = new SignalTsClient({
+      account: {
+        auth: { username: "user.1", password: "pass" },
+        device: {
+          aci: "11111111-1111-4111-8111-111111111111",
+          deviceId: 1,
+          registrationId: 42,
+        },
+      },
+      incomingEnvelopeStore: store,
+      connectionFactory: async (params) => {
+        listener = params.listener;
+        return {
+          sendMessage: vi.fn(async () => undefined),
+          disconnect: vi.fn(async () => undefined),
+          connectionInfo: () => ({ localPort: 1, ipVersion: "IPv4", toString: () => "fake" }),
+        };
+      },
+    });
+    const received: Array<{ ack: () => Promise<void> }> = [];
+    client.on("incoming", (incoming) => received.push(incoming));
+
+    try {
+      await client.connect();
+      await client.startIncomingDelivery();
+      listener!.onQueueEmpty();
+      await vi.waitFor(() => expect(listPending).toHaveBeenCalled());
+      await vi.waitFor(() => expect(received).toHaveLength(1), { timeout: 2_000 });
+      expect(listPending).toHaveBeenCalledTimes(2);
+      await received[0]!.ack();
+    } finally {
+      await client.disconnect();
+      store.close();
+      await rm(directory, { recursive: true });
+    }
+  });
+
+  it("forces server redelivery when initial envelope persistence fails", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "signal-ts-client-accept-fail-"));
+    const store = new SqliteSignalIncomingEnvelopeStore(path.join(directory, "incoming.sqlite"));
+    const accept = vi.spyOn(store, "accept").mockRejectedValueOnce(new Error("disk unavailable"));
+    let listener: Parameters<SignalConnectionFactory>[0]["listener"] | undefined;
+    const disconnect = vi.fn(async () => undefined);
+    const client = new SignalTsClient({
+      account: {
+        auth: { username: "user.1", password: "pass" },
+        device: {
+          aci: "11111111-1111-4111-8111-111111111111",
+          deviceId: 1,
+          registrationId: 42,
+        },
+      },
+      incomingEnvelopeStore: store,
+      connectionFactory: async (params) => {
+        listener = params.listener;
+        return {
+          sendMessage: vi.fn(async () => undefined),
+          disconnect,
+          connectionInfo: () => ({ localPort: 1, ipVersion: "IPv4", toString: () => "fake" }),
+        };
+      },
+    });
+    const onDisconnected = vi.fn();
+    client.on("disconnected", onDisconnected);
+    const serverAck = vi.fn();
+
+    try {
+      await client.connect();
+      listener!.onIncomingMessage(new Uint8Array([4]), 100, { send: serverAck } as never);
+      listener!.onIncomingMessage(new Uint8Array([5]), 101, { send: serverAck } as never);
+      await vi.waitFor(() => expect(onDisconnected).toHaveBeenCalledOnce(), { timeout: 5_000 });
+      expect(accept).toHaveBeenCalledOnce();
+      expect(serverAck).not.toHaveBeenCalled();
+      expect(disconnect).toHaveBeenCalledOnce();
+    } finally {
+      await client.disconnect();
+      store.close();
+      await rm(directory, { recursive: true });
+    }
+  });
+
+  it("forces server redelivery when the server ACK handle fails", async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), "signal-ts-client-ack-fail-"));
+    const store = new SqliteSignalIncomingEnvelopeStore(path.join(directory, "incoming.sqlite"));
+    let listener: Parameters<SignalConnectionFactory>[0]["listener"] | undefined;
+    const disconnect = vi.fn(async () => undefined);
+    const client = new SignalTsClient({
+      account: {
+        auth: { username: "user.1", password: "pass" },
+        device: {
+          aci: "11111111-1111-4111-8111-111111111111",
+          deviceId: 1,
+          registrationId: 42,
+        },
+      },
+      incomingEnvelopeStore: store,
+      connectionFactory: async (params) => {
+        listener = params.listener;
+        return {
+          sendMessage: vi.fn(async () => undefined),
+          disconnect,
+          connectionInfo: () => ({ localPort: 1, ipVersion: "IPv4", toString: () => "fake" }),
+        };
+      },
+    });
+    const received: Array<{ ack: () => Promise<void> }> = [];
+    const onDisconnected = vi.fn();
+    client.on("incoming", (incoming) => received.push(incoming));
+    client.on("disconnected", onDisconnected);
+
+    try {
+      await client.connect();
+      listener!.onIncomingMessage(new Uint8Array([8]), 100, {
+        send: () => {
+          throw new Error("ACK socket closed");
+        },
+      } as never);
+      listener!.onQueueEmpty();
+      await vi.waitFor(() => expect(onDisconnected).toHaveBeenCalledOnce(), { timeout: 5_000 });
+      expect(received).toEqual([]);
+      expect(disconnect).toHaveBeenCalledOnce();
+      await expect(store.listPending(16)).resolves.toHaveLength(1);
+    } finally {
+      await client.disconnect();
+      store.close();
+      await rm(directory, { recursive: true });
+    }
+  });
+
+  it(
+    "bounds durable-inbox delivery concurrency and refills on completion",
+    async () => {
+      const directory = await mkdtemp(path.join(os.tmpdir(), "signal-ts-client-bounded-"));
+      const store = new SqliteSignalIncomingEnvelopeStore(
+        path.join(directory, "incoming.sqlite"),
+      );
+      for (let value = 1; value <= 17; value += 1) {
+        await store.accept({ envelope: new Uint8Array([value]), serverDeliveredTimestamp: value });
+      }
+      let listener: Parameters<SignalConnectionFactory>[0]["listener"] | undefined;
+      const client = new SignalTsClient({
+        account: {
+          auth: { username: "user.1", password: "pass" },
+          device: {
+            aci: "11111111-1111-4111-8111-111111111111",
+            deviceId: 1,
+            registrationId: 42,
+          },
+        },
+        incomingEnvelopeStore: store,
+        connectionFactory: async (params) => {
+          listener = params.listener;
+          return {
+            sendMessage: vi.fn(async () => undefined),
+            disconnect: vi.fn(async () => undefined),
+            connectionInfo: () => ({ localPort: 1, ipVersion: "IPv4", toString: () => "fake" }),
+          };
+        },
+      });
+      const received: Array<{ ack: () => Promise<void> }> = [];
+      client.on("incoming", (incoming) => received.push(incoming));
+
+      try {
+        await client.connect();
+        listener!.onQueueEmpty();
+        await client.startIncomingDelivery();
+        await vi.waitFor(() => expect(received).toHaveLength(16));
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(received).toHaveLength(16);
+
+        await received[0]!.ack();
+        await vi.waitFor(() => expect(received).toHaveLength(17));
+      } finally {
+        await client.disconnect();
+        store.close();
+        await rm(directory, { recursive: true });
+      }
+    },
+    20_000,
+  );
+
+  it("recovers inbound decryption failures in signal-cli order", async () => {
+    const client = createTestClient();
+    const order: string[] = [];
+    const archiveSessionsForPeer = vi.fn(async () => {
+      order.push("archive");
+    });
+    const sendContentMessage = vi.fn(async () => {
+      order.push("null-message");
+      return { timestamp: 1 };
+    });
+    const sendRetryReceiptMessage = vi.fn(async () => {
+      order.push("retry-receipt");
+      return { timestamp: 2 };
+    });
+    Object.assign(client, {
+      archiveSessionsForPeer,
+      sendContentMessage,
+      sendRetryReceiptMessage,
+    });
+    const preKeyAuth = { accessKey: new Uint8Array([1]) } as never;
+    const stores = {} as Parameters<
+      SignalTsClient["recoverIncomingDecryptionFailure"]
+    >[0]["stores"];
+    const retry = {
+      recipientServiceId: "22222222-2222-4222-8222-222222222222",
+      senderDeviceId: 2,
+      timestamp: 99,
+      ciphertextType: 2,
+      originalContent: new Uint8Array([3]),
+    };
+
+    await client.recoverIncomingDecryptionFailure({ retry, stores, preKeyAuth });
+
+    expect(order).toEqual(["archive", "null-message", "retry-receipt"]);
+    expect(archiveSessionsForPeer).toHaveBeenCalledWith(
+      expect.objectContaining({ serviceId: retry.recipientServiceId, stores }),
+    );
+    expect(sendContentMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        destination: retry.recipientServiceId,
+        content: { nullMessage: { padding: expect.any(Uint8Array) } },
+        preKeyAuth,
+      }),
+    );
+    expect(sendRetryReceiptMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ destination: retry.recipientServiceId, retry, preKeyAuth }),
+    );
+  });
+
+  it("archives every established device session during inbound recovery", async () => {
+    const client = createTestClient();
+    const destination = "22222222-2222-4222-8222-222222222222";
+    const sessions = new Map(
+      [1, 4].map((deviceId) => [
+        deviceId,
+        {
+          archiveCurrentState: vi.fn(),
+        },
+      ]),
+    );
+    const saveSession = vi.fn(async (_address: ProtocolAddress, _session: unknown) => undefined);
+    const sessionStore = {
+      listDeviceIds: vi.fn(async () => [1, 4]),
+      getSession: vi.fn(async (address: ProtocolAddress) => sessions.get(address.deviceId())),
+      saveSession,
+    } as unknown as Parameters<
+      SignalTsClient["archiveSessionsForPeer"]
+    >[0]["stores"]["sessionStore"];
+
+    await client.archiveSessionsForPeer({
+      serviceId: destination,
+      stores: { sessionStore },
+    });
+
+    expect(sessions.get(1)?.archiveCurrentState).toHaveBeenCalledOnce();
+    expect(sessions.get(4)?.archiveCurrentState).toHaveBeenCalledOnce();
+    expect(saveSession.mock.calls.map(([address]) => address.deviceId())).toEqual([1, 4]);
+  });
+
+  it("does not archive sessions when recovery is canceled before the state lock", async () => {
+    const client = createTestClient();
+    const abortController = new AbortController();
+    abortController.abort();
+    const listDeviceIds = vi.fn(async () => [1]);
+    const sessionStore = {
+      listDeviceIds,
+      getSession: vi.fn(async () => null),
+      saveSession: vi.fn(async () => undefined),
+    } as unknown as Parameters<
+      SignalTsClient["archiveSessionsForPeer"]
+    >[0]["stores"]["sessionStore"];
+
+    await expect(
+      client.archiveSessionsForPeer({
+        serviceId: "22222222-2222-4222-8222-222222222222",
+        stores: { sessionStore },
+        abortSignal: abortController.signal,
+      }),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(listDeviceIds).not.toHaveBeenCalled();
+  });
+
+  it("rejects recovery when the session store cannot enumerate peer devices", async () => {
+    const client = createTestClient();
+    const sessionStore = {
+      getSession: vi.fn(async () => null),
+      saveSession: vi.fn(async () => undefined),
+    } as unknown as Parameters<
+      SignalTsClient["archiveSessionsForPeer"]
+    >[0]["stores"]["sessionStore"];
+
+    await expect(
+      client.archiveSessionsForPeer({
+        serviceId: "22222222-2222-4222-8222-222222222222",
+        stores: { sessionStore },
+      }),
+    ).rejects.toThrow("requires a session store with device enumeration");
+  });
+
   it("serializes content sends that mutate Signal session state", async () => {
     const client = createTestClient();
     const events: string[] = [];
@@ -344,11 +784,13 @@ describe("SignalTsClient", () => {
       code: ErrorCode.MismatchedDevices,
       entries: [new MismatchedDevicesEntry({ account: destination })],
     });
-    const sendMessage = vi.fn(async (_request: Parameters<SignalChatConnection["sendMessage"]>[0]) => {
-      if (sendMessage.mock.calls.length === 1) {
-        throw mismatch;
-      }
-    });
+    const sendMessage = vi.fn(
+      async (_request: Parameters<SignalChatConnection["sendMessage"]>[0]) => {
+        if (sendMessage.mock.calls.length === 1) {
+          throw mismatch;
+        }
+      },
+    );
     const connection: SignalChatConnection = {
       sendMessage,
       disconnect: vi.fn(async () => {}),
@@ -400,8 +842,7 @@ describe("SignalTsClient", () => {
     expect(sendMessage).toHaveBeenCalledTimes(2);
     expect(fetchPreKeyBundles).toHaveBeenCalledTimes(1);
     expect(sendMessage.mock.calls[1]?.[0].contents.map((content) => content.deviceId)).toEqual([
-      1,
-      2,
+      1, 2,
     ]);
     const retryBuild = buildDirectContentMessageContents.mock.calls[1]?.[0];
     expect([...(retryBuild?.refreshDeviceIds ?? [])]).toEqual([1, 2]);
@@ -441,11 +882,13 @@ describe("SignalTsClient", () => {
         }),
       ],
     });
-    const sendMessage = vi.fn(async (_request: Parameters<SignalChatConnection["sendMessage"]>[0]) => {
-      if (sendMessage.mock.calls.length === 1) {
-        throw mismatch;
-      }
-    });
+    const sendMessage = vi.fn(
+      async (_request: Parameters<SignalChatConnection["sendMessage"]>[0]) => {
+        if (sendMessage.mock.calls.length === 1) {
+          throw mismatch;
+        }
+      },
+    );
     const connection: SignalChatConnection = {
       sendMessage,
       disconnect: vi.fn(async () => {}),
@@ -495,8 +938,12 @@ describe("SignalTsClient", () => {
         originalContent: deviceMessage.contents.serialize(),
       },
       stores: {
-        sessionStore: sessionStore as Parameters<SignalTsClient["sendRetryReceiptMessage"]>[0]["stores"]["sessionStore"],
-        identityStore: {} as Parameters<SignalTsClient["sendRetryReceiptMessage"]>[0]["stores"]["identityStore"],
+        sessionStore: sessionStore as Parameters<
+          SignalTsClient["sendRetryReceiptMessage"]
+        >[0]["stores"]["sessionStore"],
+        identityStore: {} as Parameters<
+          SignalTsClient["sendRetryReceiptMessage"]
+        >[0]["stores"]["identityStore"],
       },
       preKeyBundles: [createFakePreKeyBundle(1, 287)],
     });
@@ -505,8 +952,7 @@ describe("SignalTsClient", () => {
     expect(fetchPreKeyBundles).toHaveBeenCalledTimes(1);
     expect(sendMessage.mock.calls[0]?.[0].contents.map((content) => content.deviceId)).toEqual([1]);
     expect(sendMessage.mock.calls[1]?.[0].contents.map((content) => content.deviceId)).toEqual([
-      1,
-      2,
+      1, 2,
     ]);
     expect(removeSession.mock.calls.map(([address]) => address.deviceId())).toEqual([1, 4]);
   });
@@ -724,9 +1170,7 @@ describe("SignalTsClient", () => {
     });
 
     expect(uploadAttachment).toHaveBeenCalledTimes(1);
-    expect(uploadAttachment.mock.calls[0]?.[0].attachment.contentType).toBe(
-      LONG_TEXT_CONTENT_TYPE,
-    );
+    expect(uploadAttachment.mock.calls[0]?.[0].attachment.contentType).toBe(LONG_TEXT_CONTENT_TYPE);
     expect(sentContent?.dataMessage?.body).toBe("测".repeat(666));
     expect(sentContent?.dataMessage?.attachments?.[0]).toEqual(
       expect.objectContaining({
@@ -753,7 +1197,12 @@ describe("SignalTsClient", () => {
     it("marks transport activity on a successful keepalive", async () => {
       vi.useFakeTimers();
       try {
-        const fetch = vi.fn(async () => ({ status: 200, message: "", headers: [], body: undefined }));
+        const fetch = vi.fn(async () => ({
+          status: 200,
+          message: "",
+          headers: [],
+          body: undefined,
+        }));
         const connection: SignalChatConnection = {
           sendMessage: vi.fn(async () => {}),
           sendSyncMessage: vi.fn(async () => {}),
@@ -808,5 +1257,4 @@ describe("SignalTsClient", () => {
       }
     });
   });
-
 });

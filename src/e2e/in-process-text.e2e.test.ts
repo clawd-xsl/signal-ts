@@ -20,7 +20,11 @@ import type { SendMessageRequest } from "@signalapp/libsignal-client/dist/net/ch
 import { describe, expect, it, vi } from "vitest";
 import type { SignalAccountState } from "../account.js";
 import { copyBytes } from "../bytes.js";
-import { SignalTsClient, type SignalChatConnection, type SignalSealedSenderConnection } from "../client.js";
+import {
+  SignalTsClient,
+  type SignalChatConnection,
+  type SignalSealedSenderConnection,
+} from "../client.js";
 import {
   decryptIncomingEnvelope,
   extractSignalDecryptionErrorMessageFromContent,
@@ -234,7 +238,9 @@ describe("in-process message e2e", () => {
       },
       body: "hello group",
       stores: sender.stores,
-      memberPreKeyBundles: new Map([[receiver.serviceId.getServiceIdString(), [receiver.preKeyBundle]]]),
+      memberPreKeyBundles: new Map([
+        [receiver.serviceId.getServiceIdString(), [receiver.preKeyBundle]],
+      ]),
       timestamp,
     });
     await client.sendGroupReactionMessage({
@@ -250,7 +256,9 @@ describe("in-process message e2e", () => {
         targetSentTimestamp: timestamp,
       },
       stores: sender.stores,
-      memberPreKeyBundles: new Map([[receiver.serviceId.getServiceIdString(), [receiver.preKeyBundle]]]),
+      memberPreKeyBundles: new Map([
+        [receiver.serviceId.getServiceIdString(), [receiver.preKeyBundle]],
+      ]),
       timestamp: timestamp + 1,
     });
 
@@ -374,14 +382,15 @@ describe("in-process message e2e", () => {
     if (!deviceMessage) {
       throw new Error("missing sealed outbound device message");
     }
+    const inboundEnvelope = encodeSignalEnvelope({
+      type: SignalEnvelopeType.UnidentifiedSender,
+      clientTimestamp: timestamp,
+      content: copyBytes(deviceMessage.contents),
+      destinationServiceId: receiver.account.device.aci,
+      urgent: true,
+    });
     const decrypted = await decryptIncomingEnvelope({
-      envelope: encodeSignalEnvelope({
-        type: SignalEnvelopeType.UnidentifiedSender,
-        clientTimestamp: timestamp,
-        content: copyBytes(deviceMessage.contents),
-        destinationServiceId: receiver.account.device.aci,
-        urgent: true,
-      }),
+      envelope: inboundEnvelope,
       localAddress: receiver.localAddress,
       sealedSender: {
         trustRoot,
@@ -399,6 +408,22 @@ describe("in-process message e2e", () => {
       deviceId: sender.account.device.deviceId,
     });
     expect(decrypted.content.dataMessage).toEqual({ body, timestamp });
+
+    await expect(
+      decryptIncomingEnvelope({
+        envelope: inboundEnvelope,
+        localAddress: receiver.localAddress,
+        sealedSender: {
+          trustRoot,
+          localAci: receiver.account.device.aci,
+          localDeviceId: receiver.account.device.deviceId,
+        },
+        stores: receiver.stores,
+      }),
+    ).rejects.toMatchObject({
+      name: "SignalTsDecryptionError",
+      retryReceipt: { timestamp },
+    });
 
     const receiverSent: SendMessageRequest[] = [];
     const receiverConnection: SignalChatConnection = {
@@ -443,8 +468,9 @@ describe("in-process message e2e", () => {
       throw new Error("missing sealed followup outbound device message");
     }
     expect(
-      (await sealedSenderDecryptToUsmc(secondDeviceMessage.contents, receiver.stores.identityStore))
-        .msgType(),
+      (
+        await sealedSenderDecryptToUsmc(secondDeviceMessage.contents, receiver.stores.identityStore)
+      ).msgType(),
     ).toBe(CiphertextMessageType.Whisper);
     const secondDecrypted = await decryptIncomingEnvelope({
       envelope: encodeSignalEnvelope({
@@ -497,10 +523,7 @@ async function createGeneratedAccount({
   const kyberPreKeyId = 1;
   const kyberKeyPair = KEMKeyPair.generate();
   const kyberPreKeySignature = identityKey.sign(kyberKeyPair.getPublicKey().serialize());
-  await repository.savePreKey(
-    preKeyId,
-    PreKeyRecord.new(preKeyId, preKey.getPublicKey(), preKey),
-  );
+  await repository.savePreKey(preKeyId, PreKeyRecord.new(preKeyId, preKey.getPublicKey(), preKey));
   await repository.saveSignedPreKey(
     signedPreKeyId,
     SignedPreKeyRecord.new(

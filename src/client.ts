@@ -19,9 +19,7 @@ import type {
   SendMessageRequest,
   SendSyncMessageRequest,
 } from "@signalapp/libsignal-client/dist/net/chat/AuthMessagesService.js";
-import type {
-  SendSealedMessageRequest,
-} from "@signalapp/libsignal-client/dist/net/chat/UnauthMessagesService.js";
+import type { SendSealedMessageRequest } from "@signalapp/libsignal-client/dist/net/chat/UnauthMessagesService.js";
 import type { SignalAccountState, SignalEnvironment } from "./account.js";
 import { resolveLibsignalEnvironment } from "./account.js";
 import {
@@ -31,7 +29,7 @@ import {
   type FetchLike,
   type SignalAttachmentInput,
 } from "./attachments.js";
-import { bytesToHex, utf8Bytes } from "./bytes.js";
+import { bytesToHex, utf8Bytes, type Bytes } from "./bytes.js";
 import {
   createSignalDecryptionErrorPlaintextContent,
   decryptIncomingEnvelope,
@@ -41,9 +39,14 @@ import {
   type DecryptIncomingEnvelopeParams,
   type SignalRetryReceiptRequest,
 } from "./crypto.js";
+import { SignalTsStateError } from "./errors.js";
 import { SignalEventHub } from "./events.js";
 import type { SignalEventHandler, SignalEventName } from "./events.js";
-import { SignalTsStateError } from "./errors.js";
+import type {
+  SignalIncomingEnvelopeAcceptResult,
+  SignalIncomingEnvelopeRecord,
+  SignalIncomingEnvelopeStore,
+} from "./incoming-envelope-store.js";
 import {
   createReactionSignalContent,
   createReceiptSignalContent,
@@ -86,10 +89,7 @@ export type SignalChatConnection = Pick<
   // doubles need not implement it; the real libsignal connection always has it.
   fetch?: Net.AuthenticatedChatConnection["fetch"];
   getUploadForm?: AttachmentUploadConnection["getUploadForm"];
-  sendMessage: (
-    request: SendMessageRequest,
-    options?: Net.RequestOptions,
-  ) => Promise<void>;
+  sendMessage: (request: SendMessageRequest, options?: Net.RequestOptions) => Promise<void>;
   sendSyncMessage?: (
     request: SendSyncMessageRequest,
     options?: Net.RequestOptions,
@@ -100,10 +100,7 @@ export type SignalSealedSenderConnection = Pick<
   Net.UnauthenticatedChatConnection,
   "disconnect" | "connectionInfo"
 > & {
-  sendMessage: (
-    request: SendSealedMessageRequest,
-    options?: Net.RequestOptions,
-  ) => Promise<void>;
+  sendMessage: (request: SendSealedMessageRequest, options?: Net.RequestOptions) => Promise<void>;
 };
 
 export type SignalConnectionFactory = (params: {
@@ -131,6 +128,8 @@ export type SignalTsClientOptions = {
   keepaliveIntervalMs?: number;
   /** Per-keepalive timeout before the delivery socket is treated as dead. Default 20s. */
   keepaliveTimeoutMs?: number;
+  /** Durable encrypted-envelope inbox used to persist before server acknowledgement. */
+  incomingEnvelopeStore?: SignalIncomingEnvelopeStore;
 };
 
 export type SendEncryptedMessageParams = {
@@ -182,8 +181,16 @@ export type SendRetryReceiptMessageParams = {
   destination: SignalRecipientTarget;
   retry: SignalRetryReceiptRequest;
 } & Omit<SendContentMessageBaseParams, "preKeyBundles" | "preKeyAuth"> & {
-  preKeyBundles?: PreKeyBundle[];
+    preKeyBundles?: PreKeyBundle[];
+    preKeyAuth?: PreKeyAuth;
+  };
+
+export type RecoverIncomingDecryptionFailureParams = {
+  retry: SignalRetryReceiptRequest;
+  stores: Pick<LibsignalStores, "identityStore" | "sessionStore">;
   preKeyAuth?: PreKeyAuth;
+  abortSignal?: AbortSignal;
+  traceId?: string;
 };
 
 export type SendSealedContentMessageParams = {
@@ -306,6 +313,11 @@ const DEFAULT_USER_AGENT = "OpenClaw signal-ts/0.0.0";
 // delivery socket is dead and we force a reconnect.
 const DEFAULT_KEEPALIVE_INTERVAL_MS = 30_000;
 const DEFAULT_KEEPALIVE_TIMEOUT_MS = 20_000;
+const INITIAL_INCOMING_DRAIN_RETRY_MS = 250;
+const MAX_INCOMING_DRAIN_RETRY_MS = 30_000;
+const MAX_ACTIVE_INCOMING_DELIVERIES = 16;
+const INCOMING_TOMBSTONE_PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const INCOMING_TOMBSTONE_RETENTION_MS = 7 * INCOMING_TOMBSTONE_PRUNE_INTERVAL_MS;
 const KEEPALIVE_PATH = "/v1/keepalive";
 const SIGNAL_LONG_TEXT_CONTENT_TYPE = "text/x-signal-plain";
 const SIGNAL_MESSAGE_BODY_MAX_BYTES = 2000;
@@ -320,9 +332,7 @@ function createSignalTraceId(prefix: string): string {
 function describeSignalError(err: unknown): string {
   if (err instanceof Error) {
     const cause =
-      "cause" in err && err.cause !== undefined
-        ? `; cause=${describeSignalError(err.cause)}`
-        : "";
+      "cause" in err && err.cause !== undefined ? `; cause=${describeSignalError(err.cause)}` : "";
     return `${err.name}: ${err.message}${cause}`;
   }
   if (typeof err === "string") {
@@ -443,9 +453,7 @@ function describePreKeyBundleDevices(preKeyBundles: ReadonlyArray<PreKeyBundle>)
   if (preKeyBundles.length === 0) {
     return "none";
   }
-  return preKeyBundles
-    .map((bundle) => `${bundle.deviceId()}/${bundle.registrationId()}`)
-    .join(",");
+  return preKeyBundles.map((bundle) => `${bundle.deviceId()}/${bundle.registrationId()}`).join(",");
 }
 
 type MismatchedDeviceListName = "missingDevices" | "extraDevices" | "staleDevices";
@@ -455,7 +463,10 @@ type DeviceMismatchRepair = {
   refreshAllDevices: boolean;
 };
 
-type SessionStoreWithRemoval = Pick<LibsignalStores["sessionStore"], "getSession" | "saveSession"> & {
+type SessionStoreWithRemoval = Pick<
+  LibsignalStores["sessionStore"],
+  "getSession" | "saveSession"
+> & {
   removeSession?: (address: ProtocolAddress) => Promise<void>;
 };
 
@@ -472,7 +483,9 @@ function filterMismatchedEntries(
   destination: ServiceId,
 ): MismatchedDevicesEntry[] {
   const destinationKey = describeServiceId(destination).toLowerCase();
-  return entries.filter((entry) => describeServiceId(entry.account).toLowerCase() === destinationKey);
+  return entries.filter(
+    (entry) => describeServiceId(entry.account).toLowerCase() === destinationKey,
+  );
 }
 
 function collectMismatchedDeviceIds(
@@ -510,7 +523,10 @@ function encodeUtf8(text: string): ReturnType<typeof utf8Bytes> {
   return utf8Bytes(text);
 }
 
-function splitUtf8TextAtByteLimit(text: string, limit: number): {
+function splitUtf8TextAtByteLimit(
+  text: string,
+  limit: number,
+): {
   prefix: string;
   prefixBytes: number;
 } {
@@ -564,10 +580,22 @@ export class SignalTsClient {
   private readonly connectionFactory: SignalConnectionFactory | undefined;
   private readonly sealedSenderConnectionFactory: SignalSealedSenderConnectionFactory | undefined;
   private signalStateMutationQueue: Promise<void> = Promise.resolve();
+  private incomingAdmissionQueue: Promise<void> = Promise.resolve();
+  private incomingDrainQueue: Promise<void> = Promise.resolve();
+  private readonly incomingTasks = new Set<Promise<void>>();
+  private readonly activeIncomingEnvelopeClaims = new Map<string, symbol>();
+  private serverQueueEmpty = false;
+  private incomingDeliveryStarted = false;
+  private nextIncomingTombstonePruneAt = 0;
+  private acceptingIncoming = false;
+  private connectionGeneration = 0;
+  private incomingDrainRetryAttempt = 0;
+  private incomingDrainRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  private readonly connectionCloseTasks = new Set<Promise<void>>();
   private net: Net.Net | undefined;
   private connection: SignalChatConnection | undefined;
   private keepaliveTimer: ReturnType<typeof setInterval> | undefined;
-  private keepaliveInFlight = false;
+  private keepaliveInFlightGeneration: number | undefined;
   // Last time the server proved this connection alive (a delivered envelope or
   // a successful keepalive). Consumed by the host for stale-socket health.
   private lastTransportActivityAt: number | undefined;
@@ -613,7 +641,10 @@ export class SignalTsClient {
     const current = new Promise<void>((resolve) => {
       release = resolve;
     });
-    this.signalStateMutationQueue = previous.then(() => current, () => current);
+    this.signalStateMutationQueue = previous.then(
+      () => current,
+      () => current,
+    );
     const waitStartedAt = Date.now();
     await previous.catch(() => undefined);
     const waitMs = Date.now() - waitStartedAt;
@@ -805,14 +836,19 @@ export class SignalTsClient {
       ];
     }
 
-    const providedBundle = preKeyBundles?.find((bundle) => bundle.deviceId() === retry.senderDeviceId);
-    const fetchedBundle = providedBundle ??
-      (await this.fetchPreKeyBundles({
-        destination,
-        ...(preKeyAuth !== undefined ? { preKeyAuth } : {}),
-        ...(abortSignal !== undefined ? { abortSignal } : {}),
-        device: { deviceId: retry.senderDeviceId },
-      })).find((bundle) => bundle.deviceId() === retry.senderDeviceId);
+    const providedBundle = preKeyBundles?.find(
+      (bundle) => bundle.deviceId() === retry.senderDeviceId,
+    );
+    const fetchedBundle =
+      providedBundle ??
+      (
+        await this.fetchPreKeyBundles({
+          destination,
+          ...(preKeyAuth !== undefined ? { preKeyAuth } : {}),
+          ...(abortSignal !== undefined ? { abortSignal } : {}),
+          device: { deviceId: retry.senderDeviceId },
+        })
+      ).find((bundle) => bundle.deviceId() === retry.senderDeviceId);
     if (!fetchedBundle) {
       throw new SignalTsStateError(
         `Signal session is missing for retry receipt recipient ${destination.getServiceIdString()}.${retry.senderDeviceId}`,
@@ -855,6 +891,10 @@ export class SignalTsClient {
       );
       return;
     }
+    while (this.connectionCloseTasks.size > 0) {
+      await Promise.allSettled([...this.connectionCloseTasks]);
+    }
+    const generation = ++this.connectionGeneration;
     this.logDebug(
       [
         "connect start",
@@ -870,19 +910,28 @@ export class SignalTsClient {
         userAgent: this.options.userAgent ?? DEFAULT_USER_AGENT,
       });
     this.net = net;
-    const listener = this.createListener();
+    this.serverQueueEmpty = false;
+    this.incomingDeliveryStarted = false;
+    this.acceptingIncoming = true;
+    const listener = this.createListener(generation);
     try {
-      this.connection = await (this.connectionFactory ?? defaultConnectionFactory)({
+      const connection = await (this.connectionFactory ?? defaultConnectionFactory)({
         net,
         account: this.options.account,
         listener,
         ...(abortSignal ? { abortSignal } : {}),
       });
-      this.logInfo(`connected to Signal chat (${this.connection.connectionInfo().toString()})`);
+      if (generation !== this.connectionGeneration) {
+        await connection.disconnect().catch(() => undefined);
+        throw new SignalTsStateError("Signal chat connection was interrupted while connecting");
+      }
+      this.connection = connection;
+      this.logInfo(`connected to Signal chat (${connection.connectionInfo().toString()})`);
       this.lastTransportActivityAt = Date.now();
-      this.startKeepalive();
+      this.startKeepalive(generation);
       this.events.emit("connected", undefined);
     } catch (err) {
+      this.invalidateConnectionGeneration(generation);
       this.logError("connect failed", err);
       throw err;
     }
@@ -893,14 +942,28 @@ export class SignalTsClient {
     return this.lastTransportActivityAt;
   }
 
-  private startKeepalive(): void {
+  /** Starts replay/live delivery after the consumer has made its outbound path ready. */
+  async startIncomingDelivery(): Promise<void> {
+    const generation = this.connectionGeneration;
+    this.incomingDeliveryStarted = true;
+    if (this.serverQueueEmpty && this.options.incomingEnvelopeStore) {
+      try {
+        await this.drainIncomingEnvelopeStore(generation);
+      } catch (err) {
+        this.scheduleIncomingDrainRetry(generation);
+        throw err;
+      }
+    }
+  }
+
+  private startKeepalive(generation: number): void {
     this.stopKeepalive();
     const intervalMs = this.options.keepaliveIntervalMs ?? DEFAULT_KEEPALIVE_INTERVAL_MS;
     if (intervalMs <= 0) {
       return;
     }
     this.keepaliveTimer = setInterval(() => {
-      void this.runKeepaliveTick();
+      void this.runKeepaliveTick(generation);
     }, intervalMs);
     // Node timers keep the event loop alive; this one should not on its own.
     this.keepaliveTimer.unref?.();
@@ -911,24 +974,32 @@ export class SignalTsClient {
       clearInterval(this.keepaliveTimer);
       this.keepaliveTimer = undefined;
     }
-    this.keepaliveInFlight = false;
+    this.keepaliveInFlightGeneration = undefined;
   }
 
-  private async runKeepaliveTick(): Promise<void> {
-    if (this.keepaliveInFlight) {
+  private async runKeepaliveTick(generation: number): Promise<void> {
+    if (
+      generation !== this.connectionGeneration ||
+      this.keepaliveInFlightGeneration !== undefined
+    ) {
       return;
     }
     const connection = this.connection;
     if (!connection?.fetch) {
       return;
     }
-    this.keepaliveInFlight = true;
+    this.keepaliveInFlightGeneration = generation;
     const timeoutMs = this.options.keepaliveTimeoutMs ?? DEFAULT_KEEPALIVE_TIMEOUT_MS;
     const traceId = createSignalTraceId("keepalive");
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       const response = await Promise.race([
-        connection.fetch({ verb: "GET", path: KEEPALIVE_PATH, headers: [], timeoutMillis: timeoutMs }),
+        connection.fetch({
+          verb: "GET",
+          path: KEEPALIVE_PATH,
+          headers: [],
+          timeoutMillis: timeoutMs,
+        }),
         new Promise<never>((_resolve, reject) => {
           timer = setTimeout(
             () => reject(new SignalTsStateError(`keepalive timed out after ${timeoutMs}ms`)),
@@ -945,29 +1016,37 @@ export class SignalTsClient {
       // The delivery socket is dead even if TCP is still ESTABLISHED. Tear it
       // down and surface a disconnect so the monitor reconnects.
       this.logWarn(`${traceId} keepalive failed; forcing reconnect: ${describeSignalError(err)}`);
-      this.handleDeadConnection(err instanceof Error ? err : new Error(String(err)));
+      this.handleDeadConnection(
+        err instanceof Error ? err : new Error(String(err)),
+        generation,
+      );
     } finally {
       if (timer) {
         clearTimeout(timer);
       }
-      this.keepaliveInFlight = false;
+      if (this.keepaliveInFlightGeneration === generation) {
+        this.keepaliveInFlightGeneration = undefined;
+      }
     }
   }
 
-  private handleDeadConnection(cause: Error): void {
-    this.stopKeepalive();
+  private handleDeadConnection(cause: Error, generation: number): void {
+    if (!this.invalidateConnectionGeneration(generation)) {
+      return;
+    }
     const connection = this.connection;
     this.connection = undefined;
     if (connection) {
-      void connection.disconnect().catch(() => undefined);
+      this.trackConnectionClose(connection.disconnect().catch(() => undefined));
     }
     this.events.emit("disconnected", cause);
   }
 
   async disconnect(): Promise<void> {
-    this.stopKeepalive();
+    this.invalidateConnectionGeneration(this.connectionGeneration);
     const connection = this.connection;
     this.connection = undefined;
+    let disconnectError: unknown;
     if (connection) {
       this.logDebug(`disconnect start (${connection.connectionInfo().toString()})`);
       try {
@@ -975,8 +1054,17 @@ export class SignalTsClient {
         this.logDebug("disconnect done");
       } catch (err) {
         this.logError("disconnect failed", err);
-        throw err;
+        disconnectError = err;
       }
+    }
+    while (this.incomingTasks.size > 0) {
+      await Promise.allSettled([...this.incomingTasks]);
+    }
+    while (this.connectionCloseTasks.size > 0) {
+      await Promise.allSettled([...this.connectionCloseTasks]);
+    }
+    if (disconnectError !== undefined) {
+      throw disconnectError;
     }
   }
 
@@ -1260,7 +1348,24 @@ export class SignalTsClient {
       // Custom stores without enumeration keep the bundle-driven path.
       return [];
     }
-    return await store.listDeviceIds(ProtocolAddress.new(destination, 1).name());
+    const serviceId = ProtocolAddress.new(destination, 1).name();
+    const deviceIds = await store.listDeviceIds(serviceId);
+    if (typeof sessionStore.getSession !== "function") {
+      return deviceIds;
+    }
+    const usableDeviceIds: number[] = [];
+    for (const deviceId of deviceIds) {
+      const session = await sessionStore.getSession(ProtocolAddress.new(destination, deviceId));
+      const hasCurrentState = (
+        session as { hasCurrentState?: (requirePqRatio: number, now?: Date) => boolean } | null
+      )?.hasCurrentState;
+      // libsignal-client 0.96.4 requires the PQ ratio first; zero asks only
+      // whether an active sender chain exists, excluding archived sessions.
+      if (session && (!hasCurrentState || hasCurrentState.call(session, 0))) {
+        usableDeviceIds.push(deviceId);
+      }
+    }
+    return usableDeviceIds;
   }
 
   /**
@@ -1275,8 +1380,11 @@ export class SignalTsClient {
     params: DecryptIncomingEnvelopeParams & { traceId?: string },
   ): Promise<DecryptedIncomingMessage> {
     const traceId = params.traceId ?? createSignalTraceId("incoming-decrypt");
-    return await this.runSerializedSignalStateMutation(traceId, "incoming-decrypt", undefined, async () =>
-      decryptIncomingEnvelope(params),
+    return await this.runSerializedSignalStateMutation(
+      traceId,
+      "incoming-decrypt",
+      undefined,
+      async () => decryptIncomingEnvelope(params),
     );
   }
 
@@ -1303,6 +1411,79 @@ export class SignalTsClient {
         sessionStore: params.stores.sessionStore,
       }),
     );
+  }
+
+  /** Archives every device session for a sender, matching signal-cli session renewal. */
+  async archiveSessionsForPeer(params: {
+    serviceId: string;
+    stores: Pick<LibsignalStores, "sessionStore">;
+    traceId?: string;
+    abortSignal?: AbortSignal;
+  }): Promise<void> {
+    const traceId = params.traceId ?? createSignalTraceId("sessions-archive");
+    await this.runSerializedSignalStateMutation(
+      traceId,
+      "sessions-archive",
+      params.abortSignal,
+      async () => {
+        const destination = Aci.fromUuid(params.serviceId);
+        const store = params.stores.sessionStore as typeof params.stores.sessionStore & {
+          listDeviceIds?: (serviceId: string) => Promise<number[]>;
+        };
+        if (!store.listDeviceIds) {
+          throw new SignalTsStateError(
+            "Signal session recovery requires a session store with device enumeration",
+          );
+        }
+        const deviceIds = await store.listDeviceIds(ProtocolAddress.new(destination, 1).name());
+        for (const deviceId of deviceIds) {
+          const address = ProtocolAddress.new(destination, deviceId);
+          const session = await store.getSession(address);
+          if (!session) {
+            continue;
+          }
+          session.archiveCurrentState();
+          await store.saveSession(address, session);
+          this.logDebug(
+            `${traceId} sessions-archive archived destination=${describeServiceId(destination)} device=${deviceId}`,
+          );
+        }
+      },
+    );
+  }
+
+  /**
+   * Restores a failed inbound session exactly like signal-cli: archive all
+   * sender sessions, establish fresh sessions with a null message, then ask
+   * the sender to resend the original ciphertext.
+   */
+  async recoverIncomingDecryptionFailure(
+    params: RecoverIncomingDecryptionFailureParams,
+  ): Promise<void> {
+    const traceId = params.traceId ?? createSignalTraceId("incoming-recovery");
+    const destination = params.retry.recipientServiceId;
+    await this.archiveSessionsForPeer({
+      serviceId: destination,
+      stores: params.stores,
+      traceId: `${traceId}:archive`,
+      ...(params.abortSignal === undefined ? {} : { abortSignal: params.abortSignal }),
+    });
+    // Once current sessions are archived, finish the repair even if the caller
+    // cancels. Stopping between archive and the null message strands the peer.
+    await this.sendContentMessage({
+      destination,
+      content: { nullMessage: { padding: new Uint8Array() } },
+      stores: params.stores,
+      ...(params.preKeyAuth === undefined ? {} : { preKeyAuth: params.preKeyAuth }),
+      traceId: `${traceId}:null-message`,
+    });
+    await this.sendRetryReceiptMessage({
+      destination,
+      retry: params.retry,
+      stores: params.stores,
+      ...(params.preKeyAuth === undefined ? {} : { preKeyAuth: params.preKeyAuth }),
+      traceId: `${traceId}:retry-receipt`,
+    });
   }
 
   private async sendContentMessageLocked(
@@ -1474,88 +1655,93 @@ export class SignalTsClient {
     params: SendRetryReceiptMessageParams,
   ): Promise<{ timestamp: number }> {
     const traceId = params.traceId ?? createSignalTraceId("retry-receipt");
-    return await this.runSerializedSignalStateMutation(traceId, "retry-receipt", params.abortSignal, async () => {
-    const timestamp = params.timestamp ?? Date.now();
-    this.logDebug(
-      [
-        `${traceId} retry-receipt start`,
-        `target=${describeRecipientTarget(params.destination)}`,
-        `timestamp=${timestamp}`,
-        `failedTimestamp=${params.retry.timestamp}`,
-        `senderDevice=${params.retry.senderDeviceId}`,
-      ].join(" "),
-    );
-    try {
-      const destination = await this.resolveRecipient(
-        params.destination,
-        params.abortSignal,
-        traceId,
-      );
-      let contents = await this.buildRetryReceiptContentsForDevice({
-        traceId,
-        destination,
-        retry: params.retry,
-        stores: params.stores,
-        ...(params.preKeyBundles !== undefined ? { preKeyBundles: params.preKeyBundles } : {}),
-        ...(params.preKeyAuth !== undefined ? { preKeyAuth: params.preKeyAuth } : {}),
-        ...(params.abortSignal !== undefined ? { abortSignal: params.abortSignal } : {}),
-      });
-      const sendParams: SendEncryptedMessageParams = {
-        traceId,
-        destination,
-        timestamp,
-        contents,
-        ...(params.onlineOnly !== undefined ? { onlineOnly: params.onlineOnly } : {}),
-        ...(params.urgent !== undefined ? { urgent: params.urgent } : {}),
-        ...(params.abortSignal ? { abortSignal: params.abortSignal } : {}),
-      };
-      let result: { timestamp: number };
-      try {
-        result = await this.sendEncryptedMessage(sendParams);
-      } catch (err) {
-        if (!isMismatchedDevicesError(err)) {
-          throw err;
-        }
-        const repair = await this.repairMismatchedDevices({
-          err,
-          traceId,
-          operation: "retry-receipt",
-          destination,
-          stores: params.stores,
-        });
-        if (!repair) {
-          throw err;
-        }
-        const retryPreKeyBundles = await this.fetchPreKeyBundles({
-          destination,
-          ...(params.preKeyAuth !== undefined ? { preKeyAuth: params.preKeyAuth } : {}),
-          ...(params.abortSignal !== undefined ? { abortSignal: params.abortSignal } : {}),
-        });
+    return await this.runSerializedSignalStateMutation(
+      traceId,
+      "retry-receipt",
+      params.abortSignal,
+      async () => {
+        const timestamp = params.timestamp ?? Date.now();
         this.logDebug(
-          `${traceId} retry-receipt device-retry prekeys done destination=${describeServiceId(destination)} count=${retryPreKeyBundles.length} devices=${describePreKeyBundleDevices(retryPreKeyBundles)}`,
+          [
+            `${traceId} retry-receipt start`,
+            `target=${describeRecipientTarget(params.destination)}`,
+            `timestamp=${timestamp}`,
+            `failedTimestamp=${params.retry.timestamp}`,
+            `senderDevice=${params.retry.senderDeviceId}`,
+          ].join(" "),
         );
-        contents = this.buildRetryReceiptContentsFromPreKeyBundles({
-          retry: params.retry,
-          preKeyBundles: retryPreKeyBundles,
-        });
-        result = await this.sendEncryptedMessage({
-          ...sendParams,
-          traceId: `${traceId}:device-retry`,
-          contents,
-        });
-      }
-      this.logInfo(
-        `${traceId} retry-receipt done destination=${describeServiceId(destination)} timestamp=${result.timestamp} failedTimestamp=${params.retry.timestamp}`,
-      );
-      return result;
-    } catch (err) {
-      this.logError(
-        `${traceId} retry-receipt failed target=${describeRecipientTarget(params.destination)} failedTimestamp=${params.retry.timestamp} senderDevice=${params.retry.senderDeviceId}`,
-        err,
-      );
-      throw err;
-    }
-    });
+        try {
+          const destination = await this.resolveRecipient(
+            params.destination,
+            params.abortSignal,
+            traceId,
+          );
+          let contents = await this.buildRetryReceiptContentsForDevice({
+            traceId,
+            destination,
+            retry: params.retry,
+            stores: params.stores,
+            ...(params.preKeyBundles !== undefined ? { preKeyBundles: params.preKeyBundles } : {}),
+            ...(params.preKeyAuth !== undefined ? { preKeyAuth: params.preKeyAuth } : {}),
+            ...(params.abortSignal !== undefined ? { abortSignal: params.abortSignal } : {}),
+          });
+          const sendParams: SendEncryptedMessageParams = {
+            traceId,
+            destination,
+            timestamp,
+            contents,
+            ...(params.onlineOnly !== undefined ? { onlineOnly: params.onlineOnly } : {}),
+            ...(params.urgent !== undefined ? { urgent: params.urgent } : {}),
+            ...(params.abortSignal ? { abortSignal: params.abortSignal } : {}),
+          };
+          let result: { timestamp: number };
+          try {
+            result = await this.sendEncryptedMessage(sendParams);
+          } catch (err) {
+            if (!isMismatchedDevicesError(err)) {
+              throw err;
+            }
+            const repair = await this.repairMismatchedDevices({
+              err,
+              traceId,
+              operation: "retry-receipt",
+              destination,
+              stores: params.stores,
+            });
+            if (!repair) {
+              throw err;
+            }
+            const retryPreKeyBundles = await this.fetchPreKeyBundles({
+              destination,
+              ...(params.preKeyAuth !== undefined ? { preKeyAuth: params.preKeyAuth } : {}),
+              ...(params.abortSignal !== undefined ? { abortSignal: params.abortSignal } : {}),
+            });
+            this.logDebug(
+              `${traceId} retry-receipt device-retry prekeys done destination=${describeServiceId(destination)} count=${retryPreKeyBundles.length} devices=${describePreKeyBundleDevices(retryPreKeyBundles)}`,
+            );
+            contents = this.buildRetryReceiptContentsFromPreKeyBundles({
+              retry: params.retry,
+              preKeyBundles: retryPreKeyBundles,
+            });
+            result = await this.sendEncryptedMessage({
+              ...sendParams,
+              traceId: `${traceId}:device-retry`,
+              contents,
+            });
+          }
+          this.logInfo(
+            `${traceId} retry-receipt done destination=${describeServiceId(destination)} timestamp=${result.timestamp} failedTimestamp=${params.retry.timestamp}`,
+          );
+          return result;
+        } catch (err) {
+          this.logError(
+            `${traceId} retry-receipt failed target=${describeRecipientTarget(params.destination)} failedTimestamp=${params.retry.timestamp} senderDevice=${params.retry.senderDeviceId}`,
+            err,
+          );
+          throw err;
+        }
+      },
+    );
   }
 
   async sendSealedContentMessage(
@@ -1605,44 +1791,44 @@ export class SignalTsClient {
         "sealed-send",
         params.abortSignal,
         async () => {
-        const localAddress = this.localAddress();
-        const payload = encodeSignalContent(params.content);
-        const encryptedContents: Array<SendSealedMessageRequest["contents"][number]> = [];
-        for (const bundle of preKeyBundles) {
-          const remoteAddress = ProtocolAddress.new(destination, bundle.deviceId());
-          const existingSession = await params.stores.sessionStore.getSession(remoteAddress);
-          this.logDebug(
-            `${traceId} sealed-send encrypt device=${bundle.deviceId()} registration=${bundle.registrationId()} existingSession=${existingSession ? "yes" : "no"}`,
-          );
-          if (!existingSession) {
-            await processPreKeyBundle(
-              bundle,
+          const localAddress = this.localAddress();
+          const payload = encodeSignalContent(params.content);
+          const encryptedContents: Array<SendSealedMessageRequest["contents"][number]> = [];
+          for (const bundle of preKeyBundles) {
+            const remoteAddress = ProtocolAddress.new(destination, bundle.deviceId());
+            const existingSession = await params.stores.sessionStore.getSession(remoteAddress);
+            this.logDebug(
+              `${traceId} sealed-send encrypt device=${bundle.deviceId()} registration=${bundle.registrationId()} existingSession=${existingSession ? "yes" : "no"}`,
+            );
+            if (!existingSession) {
+              await processPreKeyBundle(
+                bundle,
+                remoteAddress,
+                localAddress,
+                params.stores.sessionStore,
+                params.stores.identityStore,
+              );
+              this.logDebug(
+                `${traceId} sealed-send processed prekey bundle device=${bundle.deviceId()} registration=${bundle.registrationId()}`,
+              );
+            }
+            const encrypted = await sealedSenderEncryptMessage(
+              padSignalMessageBody(payload),
               remoteAddress,
-              localAddress,
+              params.senderCertificate,
               params.stores.sessionStore,
               params.stores.identityStore,
             );
             this.logDebug(
-              `${traceId} sealed-send processed prekey bundle device=${bundle.deviceId()} registration=${bundle.registrationId()}`,
+              `${traceId} sealed-send encrypted device=${bundle.deviceId()} registration=${bundle.registrationId()} bytes=${encrypted.byteLength}`,
             );
+            encryptedContents.push({
+              deviceId: bundle.deviceId(),
+              registrationId: bundle.registrationId(),
+              contents: encrypted,
+            });
           }
-          const encrypted = await sealedSenderEncryptMessage(
-            padSignalMessageBody(payload),
-            remoteAddress,
-            params.senderCertificate,
-            params.stores.sessionStore,
-            params.stores.identityStore,
-          );
-          this.logDebug(
-            `${traceId} sealed-send encrypted device=${bundle.deviceId()} registration=${bundle.registrationId()} bytes=${encrypted.byteLength}`,
-          );
-          encryptedContents.push({
-            deviceId: bundle.deviceId(),
-            registrationId: bundle.registrationId(),
-            contents: encrypted,
-          });
-        }
-        return encryptedContents;
+          return encryptedContents;
         },
       );
 
@@ -1725,65 +1911,70 @@ export class SignalTsClient {
     params: SendSyncContentMessageParams,
   ): Promise<{ timestamp: number }> {
     const traceId = params.traceId ?? createSignalTraceId("sync-content");
-    return await this.runSerializedSignalStateMutation(traceId, "sync-content", params.abortSignal, async () => {
-    if (params.preKeyBundles.length === 0) {
-      this.logWarn(`${traceId} sync-content rejected: no linked-device prekey bundles`);
-      throw new SignalTsStateError("Signal sync message requires linked-device prekey bundles");
-    }
-    const timestamp = params.timestamp ?? Date.now();
-    this.logDebug(
-      `${traceId} sync-content start timestamp=${timestamp} content=${describeSignalContent(params.content)} prekeys=${describePreKeyBundleDevices(params.preKeyBundles)}`,
-    );
-    try {
-      const localAddress = this.localAddress();
-      const destination = Aci.fromUuid(this.options.account.device.aci);
-      const payload = encodeSignalContent(params.content);
-      this.logDebug(`${traceId} sync-content payload encoded bytes=${payload.byteLength}`);
-      const contents: Array<SendSyncMessageRequest["contents"][number]> = [];
-      for (const bundle of params.preKeyBundles) {
-        const remoteAddress = ProtocolAddress.new(destination, bundle.deviceId());
-        const existingSession = await params.stores.sessionStore.getSession(remoteAddress);
-        this.logDebug(
-          `${traceId} sync-content encrypt device=${bundle.deviceId()} registration=${bundle.registrationId()} existingSession=${existingSession ? "yes" : "no"}`,
-        );
-        const device = {
-          serviceId: destination,
-          deviceId: bundle.deviceId(),
-          registrationId: bundle.registrationId(),
-        };
-        if (!existingSession) {
-          Object.assign(device, { preKeyBundle: bundle });
+    return await this.runSerializedSignalStateMutation(
+      traceId,
+      "sync-content",
+      params.abortSignal,
+      async () => {
+        if (params.preKeyBundles.length === 0) {
+          this.logWarn(`${traceId} sync-content rejected: no linked-device prekey bundles`);
+          throw new SignalTsStateError("Signal sync message requires linked-device prekey bundles");
         }
-        const encrypted = await encryptPayloadForDevice({
-          localAddress,
-          device,
-          payload,
-          stores: params.stores,
-        });
+        const timestamp = params.timestamp ?? Date.now();
         this.logDebug(
-          `${traceId} sync-content encrypted device=${encrypted.deviceId} registration=${encrypted.registrationId} ciphertextType=${encrypted.contents.type()}`,
+          `${traceId} sync-content start timestamp=${timestamp} content=${describeSignalContent(params.content)} prekeys=${describePreKeyBundleDevices(params.preKeyBundles)}`,
         );
-        contents.push(encrypted);
-      }
-      const result = await this.sendSyncMessage({
-        traceId,
-        timestamp,
-        contents,
-        ...(params.urgent !== undefined ? { urgent: params.urgent } : {}),
-        ...(params.abortSignal ? { abortSignal: params.abortSignal } : {}),
-      });
-      this.logInfo(
-        `${traceId} sync-content done timestamp=${result.timestamp} devices=${describeOutboundDevices(contents)}`,
-      );
-      return result;
-    } catch (err) {
-      this.logError(
-        `${traceId} sync-content failed timestamp=${timestamp} content=${describeSignalContent(params.content)}`,
-        err,
-      );
-      throw err;
-    }
-    });
+        try {
+          const localAddress = this.localAddress();
+          const destination = Aci.fromUuid(this.options.account.device.aci);
+          const payload = encodeSignalContent(params.content);
+          this.logDebug(`${traceId} sync-content payload encoded bytes=${payload.byteLength}`);
+          const contents: Array<SendSyncMessageRequest["contents"][number]> = [];
+          for (const bundle of params.preKeyBundles) {
+            const remoteAddress = ProtocolAddress.new(destination, bundle.deviceId());
+            const existingSession = await params.stores.sessionStore.getSession(remoteAddress);
+            this.logDebug(
+              `${traceId} sync-content encrypt device=${bundle.deviceId()} registration=${bundle.registrationId()} existingSession=${existingSession ? "yes" : "no"}`,
+            );
+            const device = {
+              serviceId: destination,
+              deviceId: bundle.deviceId(),
+              registrationId: bundle.registrationId(),
+            };
+            if (!existingSession) {
+              Object.assign(device, { preKeyBundle: bundle });
+            }
+            const encrypted = await encryptPayloadForDevice({
+              localAddress,
+              device,
+              payload,
+              stores: params.stores,
+            });
+            this.logDebug(
+              `${traceId} sync-content encrypted device=${encrypted.deviceId} registration=${encrypted.registrationId} ciphertextType=${encrypted.contents.type()}`,
+            );
+            contents.push(encrypted);
+          }
+          const result = await this.sendSyncMessage({
+            traceId,
+            timestamp,
+            contents,
+            ...(params.urgent !== undefined ? { urgent: params.urgent } : {}),
+            ...(params.abortSignal ? { abortSignal: params.abortSignal } : {}),
+          });
+          this.logInfo(
+            `${traceId} sync-content done timestamp=${result.timestamp} devices=${describeOutboundDevices(contents)}`,
+          );
+          return result;
+        } catch (err) {
+          this.logError(
+            `${traceId} sync-content failed timestamp=${timestamp} content=${describeSignalContent(params.content)}`,
+            err,
+          );
+          throw err;
+        }
+      },
+    );
   }
 
   async sendGroupMessage(params: SendGroupMessageParams): Promise<{
@@ -2073,7 +2264,9 @@ export class SignalTsClient {
       this.logWarn(`${traceId} attachment-upload failed: connection missing getUploadForm`);
       throw new SignalTsStateError("Signal chat connection does not support attachment uploads");
     }
-    this.logDebug(`${traceId} attachment-upload start ${describeAttachmentInput(params.attachment)}`);
+    this.logDebug(
+      `${traceId} attachment-upload start ${describeAttachmentInput(params.attachment)}`,
+    );
     const getUploadForm: AttachmentUploadConnection["getUploadForm"] = async (request, options) => {
       this.logDebug(`${traceId} attachment-upload form start uploadSize=${request.uploadSize}`);
       try {
@@ -2083,7 +2276,10 @@ export class SignalTsClient {
         );
         return form;
       } catch (err) {
-        this.logError(`${traceId} attachment-upload form failed uploadSize=${request.uploadSize}`, err);
+        this.logError(
+          `${traceId} attachment-upload form failed uploadSize=${request.uploadSize}`,
+          err,
+        );
         throw err;
       }
     };
@@ -2119,7 +2315,10 @@ export class SignalTsClient {
       );
       return result;
     } catch (err) {
-      this.logError(`${traceId} attachment-upload failed ${describeAttachmentInput(params.attachment)}`, err);
+      this.logError(
+        `${traceId} attachment-upload failed ${describeAttachmentInput(params.attachment)}`,
+        err,
+      );
       throw err;
     }
   }
@@ -2248,46 +2447,309 @@ export class SignalTsClient {
     });
   }
 
-  private createListener(): Net.ChatServiceListener {
+  private createListener(generation: number): Net.ChatServiceListener {
     return {
       onConnectionInterrupted: (cause) => {
+        if (generation !== this.connectionGeneration) {
+          return;
+        }
         this.logWarn(
           `Signal chat connection interrupted: ${cause ? describeSignalError(cause) : "null"}`,
         );
-        this.stopKeepalive();
-        this.events.emit("disconnected", cause);
+        this.handleDeadConnection(
+          cause ?? new Error("Signal chat connection interrupted"),
+          generation,
+        );
       },
       onIncomingMessage: (envelope, timestamp, ack) => {
         const traceId = createSignalTraceId("incoming");
+        if (generation !== this.connectionGeneration || !this.acceptingIncoming) {
+          // Do not ACK a callback racing shutdown. Signal retains it for the
+          // next authenticated connection, where it can be persisted first.
+          this.logWarn(`${traceId} incoming skipped while delivery is stopping`);
+          return;
+        }
         // A delivered envelope proves the socket is live.
         this.lastTransportActivityAt = Date.now();
-        this.logInfo(`${traceId} incoming envelope ${describeIncomingEnvelope(envelope, timestamp)}`);
-        this.events.emit("incoming", {
-          envelope,
-          timestamp,
-          ack: () => {
-            this.logDebug(`${traceId} incoming ack start status=200`);
-            try {
-              ack.send(200);
-              this.logDebug(`${traceId} incoming ack done status=200`);
-            } catch (err) {
-              this.logError(`${traceId} incoming ack failed status=200`, err);
-              throw err;
-            }
-          },
-        });
+        this.logInfo(
+          `${traceId} incoming envelope ${describeIncomingEnvelope(envelope, timestamp)}`,
+        );
+        if (!this.options.incomingEnvelopeStore) {
+          this.events.emit("incoming", {
+            envelope,
+            timestamp,
+            ack: async () => {
+              this.logDebug(`${traceId} incoming ack start status=200`);
+              try {
+                ack.send(200);
+                this.logDebug(`${traceId} incoming ack done status=200`);
+              } catch (err) {
+                this.logError(`${traceId} incoming ack failed status=200`, err);
+                throw err;
+              }
+            },
+          });
+          return;
+        }
+        this.trackIncomingTask(
+          this.admitIncomingEnvelope({
+            envelope,
+            timestamp,
+            generation,
+            sendServerAck: () => ack.send(200),
+          }),
+        );
       },
       onQueueEmpty: () => {
+        if (generation !== this.connectionGeneration) {
+          return;
+        }
         this.logDebug("incoming queue empty");
+        this.serverQueueEmpty = true;
+        if (this.options.incomingEnvelopeStore && this.incomingDeliveryStarted) {
+          this.requestIncomingDrain(generation);
+        }
         this.events.emit("queueEmpty", undefined);
       },
       onReceivedAlerts: (alerts) => {
+        if (generation !== this.connectionGeneration) {
+          return;
+        }
         if (alerts.length > 0) {
           this.logger?.warn?.(`Signal chat alerts: ${alerts.join(", ")}`);
         }
       },
     };
   }
+
+  private trackIncomingTask(task: Promise<void>): void {
+    const tracked = task
+      .catch((err) => {
+        this.logError("incoming durable-envelope task failed", err);
+      })
+      .finally(() => this.incomingTasks.delete(tracked));
+    this.incomingTasks.add(tracked);
+  }
+
+  private async admitIncomingEnvelope(params: {
+    envelope: Bytes;
+    timestamp: number;
+    generation: number;
+    sendServerAck: () => void;
+  }): Promise<void> {
+    const run = this.incomingAdmissionQueue.then(async () => {
+      if (params.generation !== this.connectionGeneration || !this.acceptingIncoming) {
+        return;
+      }
+      await this.acceptIncomingEnvelope(params);
+    });
+    this.incomingAdmissionQueue = run.catch(() => undefined);
+    await run;
+  }
+
+  private async acceptIncomingEnvelope(params: {
+    envelope: Bytes;
+    timestamp: number;
+    generation: number;
+    sendServerAck: () => void;
+  }): Promise<void> {
+    const store = this.options.incomingEnvelopeStore;
+    if (!store) {
+      return;
+    }
+    let accepted: SignalIncomingEnvelopeAcceptResult;
+    try {
+      accepted = await store.accept({
+        envelope: params.envelope,
+        serverDeliveredTimestamp: params.timestamp,
+      });
+    } catch (err) {
+      // We cannot ACK bytes that are not durable. Closing the socket makes the
+      // Signal server retain and redeliver the envelope on the next connection.
+      this.handleDeadConnection(
+        err instanceof Error ? err : new SignalTsStateError(String(err)),
+        params.generation,
+      );
+      throw err;
+    }
+    this.logDebug(
+      `incoming cached id=${accepted.record.id} duplicate=${accepted.duplicate ? "yes" : "no"}`,
+    );
+    if (params.generation !== this.connectionGeneration || !this.acceptingIncoming) {
+      return;
+    }
+    try {
+      params.sendServerAck();
+      this.logDebug(`incoming server ack done id=${accepted.record.id} status=200`);
+    } catch (err) {
+      this.logError(`incoming server ack failed id=${accepted.record.id} status=200`, err);
+      this.handleDeadConnection(
+        err instanceof Error ? err : new SignalTsStateError(String(err)),
+        params.generation,
+      );
+      return;
+    }
+    if (
+      accepted.record.completedAt !== undefined ||
+      !this.serverQueueEmpty ||
+      !this.incomingDeliveryStarted
+    ) {
+      return;
+    }
+    try {
+      await this.drainIncomingEnvelopeStore(params.generation);
+    } catch (err) {
+      this.scheduleIncomingDrainRetry(params.generation);
+      throw err;
+    }
+  }
+
+  private async drainIncomingEnvelopeStore(generation: number): Promise<void> {
+    const store = this.options.incomingEnvelopeStore;
+    if (!store || !this.isIncomingDeliveryActive(generation)) {
+      return;
+    }
+    const run = this.incomingDrainQueue.then(async () => {
+      if (!this.isIncomingDeliveryActive(generation)) {
+        return;
+      }
+      const now = Date.now();
+      if (now >= this.nextIncomingTombstonePruneAt) {
+        await store.pruneCompleted(now - INCOMING_TOMBSTONE_RETENTION_MS);
+        if (!this.isIncomingDeliveryActive(generation)) {
+          return;
+        }
+        this.nextIncomingTombstonePruneAt = now + INCOMING_TOMBSTONE_PRUNE_INTERVAL_MS;
+      }
+      if (this.activeIncomingEnvelopeClaims.size >= MAX_ACTIVE_INCOMING_DELIVERIES) {
+        this.clearIncomingDrainRetry();
+        return;
+      }
+      for (const record of await store.listPending(MAX_ACTIVE_INCOMING_DELIVERIES)) {
+        if (!this.isIncomingDeliveryActive(generation)) {
+          return;
+        }
+        this.emitDurableIncomingEnvelope(record, generation);
+        if (this.activeIncomingEnvelopeClaims.size >= MAX_ACTIVE_INCOMING_DELIVERIES) {
+          break;
+        }
+      }
+      if (this.isIncomingDeliveryActive(generation)) {
+        this.clearIncomingDrainRetry();
+      }
+    });
+    this.incomingDrainQueue = run.catch(() => undefined);
+    await run;
+  }
+
+  private emitDurableIncomingEnvelope(
+    record: SignalIncomingEnvelopeRecord,
+    generation: number,
+  ): void {
+    if (
+      !this.isIncomingDeliveryActive(generation) ||
+      this.activeIncomingEnvelopeClaims.has(record.id)
+    ) {
+      return;
+    }
+    const claim = Symbol(record.id);
+    this.activeIncomingEnvelopeClaims.set(record.id, claim);
+    let completion: Promise<void> | undefined;
+    try {
+      this.events.emit("incoming", {
+        envelope: record.envelope,
+        timestamp: record.serverDeliveredTimestamp,
+        ack: () => {
+          completion ??= this.options
+            .incomingEnvelopeStore!.complete(record.id)
+            .then(() => {
+              this.logDebug(`incoming consumer complete id=${record.id}`);
+              if (this.activeIncomingEnvelopeClaims.get(record.id) === claim) {
+                this.activeIncomingEnvelopeClaims.delete(record.id);
+                this.requestIncomingDrain(generation);
+              }
+            })
+            .catch((err) => {
+              completion = undefined;
+              if (this.activeIncomingEnvelopeClaims.get(record.id) === claim) {
+                this.activeIncomingEnvelopeClaims.delete(record.id);
+                this.scheduleIncomingDrainRetry(generation);
+              }
+              throw err;
+            });
+          return completion;
+        },
+      });
+    } catch (err) {
+      if (this.activeIncomingEnvelopeClaims.get(record.id) === claim) {
+        this.activeIncomingEnvelopeClaims.delete(record.id);
+      }
+      throw err;
+    }
+  }
+
+  private isIncomingDeliveryActive(generation: number): boolean {
+    return (
+      generation === this.connectionGeneration &&
+      this.acceptingIncoming &&
+      this.serverQueueEmpty &&
+      this.incomingDeliveryStarted
+    );
+  }
+
+  private requestIncomingDrain(generation: number): void {
+    this.trackIncomingTask(
+      this.drainIncomingEnvelopeStore(generation).catch((err) => {
+        this.scheduleIncomingDrainRetry(generation);
+        throw err;
+      }),
+    );
+  }
+
+  private scheduleIncomingDrainRetry(generation: number): void {
+    if (!this.isIncomingDeliveryActive(generation) || this.incomingDrainRetryTimer) {
+      return;
+    }
+    const delay = Math.min(
+      MAX_INCOMING_DRAIN_RETRY_MS,
+      INITIAL_INCOMING_DRAIN_RETRY_MS * 2 ** this.incomingDrainRetryAttempt,
+    );
+    this.incomingDrainRetryAttempt += 1;
+    this.incomingDrainRetryTimer = setTimeout(() => {
+      this.incomingDrainRetryTimer = undefined;
+      this.requestIncomingDrain(generation);
+    }, delay);
+    this.incomingDrainRetryTimer.unref?.();
+    this.logWarn(`incoming durable-envelope drain retry scheduled in ${delay}ms`);
+  }
+
+  private clearIncomingDrainRetry(): void {
+    if (this.incomingDrainRetryTimer) {
+      clearTimeout(this.incomingDrainRetryTimer);
+      this.incomingDrainRetryTimer = undefined;
+    }
+    this.incomingDrainRetryAttempt = 0;
+  }
+
+  private invalidateConnectionGeneration(generation: number): boolean {
+    if (generation !== this.connectionGeneration) {
+      return false;
+    }
+    this.connectionGeneration += 1;
+    this.stopKeepalive();
+    this.acceptingIncoming = false;
+    this.serverQueueEmpty = false;
+    this.incomingDeliveryStarted = false;
+    this.clearIncomingDrainRetry();
+    this.activeIncomingEnvelopeClaims.clear();
+    return true;
+  }
+
+  private trackConnectionClose(task: Promise<void>): void {
+    const tracked = task.finally(() => this.connectionCloseTasks.delete(tracked));
+    this.connectionCloseTasks.add(tracked);
+  }
+
 }
 
 async function defaultConnectionFactory({
@@ -2301,13 +2763,13 @@ async function defaultConnectionFactory({
   listener: Net.ChatServiceListener;
   abortSignal?: AbortSignal;
 }): Promise<SignalChatConnection> {
-  return await net.connectAuthenticatedChat(
+  return (await net.connectAuthenticatedChat(
     account.auth.username,
     account.auth.password,
     account.receiveStories ?? false,
     listener,
     abortSignal ? { abortSignal } : undefined,
-  ) as unknown as SignalChatConnection;
+  )) as unknown as SignalChatConnection;
 }
 
 async function defaultSealedSenderConnectionFactory({
@@ -2317,10 +2779,10 @@ async function defaultSealedSenderConnectionFactory({
   net: Net.Net;
   abortSignal?: AbortSignal;
 }): Promise<SignalSealedSenderConnection> {
-  return await net.connectUnauthenticatedChat(
+  return (await net.connectUnauthenticatedChat(
     { onConnectionInterrupted: () => {} },
     abortSignal ? { abortSignal } : undefined,
-  ) as unknown as SignalSealedSenderConnection;
+  )) as unknown as SignalSealedSenderConnection;
 }
 
 function resolveDestination(destination: ServiceId | string): ServiceId {
@@ -2330,7 +2792,9 @@ function resolveDestination(destination: ServiceId | string): ServiceId {
   return Aci.fromUuid(destination);
 }
 
-function resolveSealedSenderAuth(auth: SealedSenderAuth | undefined): SendSealedMessageRequest["auth"] {
+function resolveSealedSenderAuth(
+  auth: SealedSenderAuth | undefined,
+): SendSealedMessageRequest["auth"] {
   if (!auth || auth.kind === "unrestricted") {
     return "unrestricted";
   }
